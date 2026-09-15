@@ -1,0 +1,43 @@
+[changelog]
+header = """
+# Changelog\n
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).\n
+"""
+body = """
+{% if version -%}
+    ## {% if release_link %}[{{ version | trim_start_matches(pat="v") }}]({{ release_link }}){% else %}[{{ version | trim_start_matches(pat="v") }}]{% endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else -%}
+    ## [Unreleased]
+{% endif -%}
+{% for entry in commits | commit_groups(groups=commit_parsers_groups) %}
+    ### {{ entry.group | striptags | trim | upper_first }}
+    {% for commit in entry.commits %}
+        - {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
+            {% if commit.breaking %}[**breaking**] {% endif %}\
+            {{ commit.message | split(pat="\n") | first | upper_first | trim }}\
+    {% endfor %}
+{% endfor %}\n
+"""
+trim = true
+protect_breaking_commits = true
+sort_commits = "oldest"
+commit_parsers = [
+    { message = "^feat", group = "<!-- 0 --> Features" },
+    { message = "^fix", group = "<!-- 1 --> Bug Fixes" },
+    { message = "^doc", group = "<!-- 3 --> Documentation" },
+    { message = "^perf", group = "<!-- 4 --> Performance" },
+    { message = "^refactor", group = "<!-- 2 --> Refactor" },
+    { message = "^style", group = "<!-- 5 --> Styling" },
+    { message = "^test", group = "<!-- 6 --> Testing" },
+    { message = "^chore\\(release\\): prepare for", skip = true },
+    { message = "^chore\\(deps.*\\)", skip = true },
+    { message = "^chore\\(pr\\)", skip = true },
+    { message = "^chore\\(pull\\)", skip = true },
+    { message = "^chore|^ci", group = "<!-- 7 --> Misc." },
+    { body = ".*security", group = "<!-- 8 --> Security" },
+    { message = "^revert", group = "<!-- 9 --> Revert" },
+    { message = ".*", group = "<!-- 10 --> Other" },
+]
