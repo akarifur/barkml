@@ -59,7 +59,7 @@ impl<'de, 'a> Deserializer<'de> for ValueDeserializer<'a> {
             Data::Bytes(bytes) => visitor.visit_bytes(bytes),
             Data::Version(version) => visitor.visit_str(&version.to_string()),
             Data::Require(req) => visitor.visit_str(&req.to_string()),
-            Data::Reference(_) => error::UnresolvedReferenceSnafu.fail(),
+            Data::Reference(_) | Data::Template(_) => error::UnresolvedReferenceSnafu.fail(),
             Data::Symbol(symbol) => visitor.visit_str(symbol),
         }
     }

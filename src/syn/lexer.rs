@@ -203,9 +203,48 @@ pub enum Token {
     LegacyMacro(Location),
     #[regex(r"b'[-A-Za-z0-9+/]*={0,3}'", byte_string)]
     ByteString((Location, Vec<u8>)),
+    /// Single-quoted literal string (compatibility form). Escapes are
+    /// resolved leniently during lexing; contents are never interpolated.
     #[regex(r"'([^'\\]|\\.)*'", quote_string)]
-    #[regex(r#""([^"\\]|\\.)*""#, quote_string)]
     String((Location, String)),
+    /// Double-quoted single-line string. Raw content; escapes are
+    /// validated and resolved by the parser.
+    #[regex(r#""([^"\\\n]|\\.)*""#, raw_string, priority = 4)]
+    DQString((Location, String)),
+    /// Multiline string (`"""..."""`). Content is verbatim: no dedenting,
+    /// no trimming; escapes follow the documented rules.
+    #[regex(
+        r##""""(?:[^"\\]|\\.|"[^"]|""[^"\\])*""""##,
+        raw_multiline_string,
+        priority = 5
+    )]
+    TripleString((Location, String)),
+    /// Interpolated single-line string (`f"..."`). Raw content; the parser
+    /// splits reference placeholders and resolves escapes.
+    #[regex(r#"f"([^"\\\n]|\\.)*""#, raw_string, priority = 6)]
+    FString((Location, String)),
+    /// Interpolated multiline string (`f"""..."""`).
+    #[regex(
+        r##"f"""(?:[^"\\]|\\.|"[^"]|""[^"\\])*""""##,
+        raw_multiline_string,
+        priority = 7
+    )]
+    FTripleString((Location, String)),
+    /// Unterminated string literal; only matches when no closing delimiter
+    /// follows, producing a source-aware error during lexing.
+    #[regex(r#""([^"\\\n]|\\.)*"#, unterminated_string, priority = 1)]
+    #[regex(r#"f"([^"\\\n]|\\.)*"#, unterminated_string, priority = 1)]
+    #[regex(
+        r##""""(?:[^"\\]|\\.|"[^"]|""[^"\\])*"##,
+        unterminated_string,
+        priority = 1
+    )]
+    #[regex(
+        r##"f"""(?:[^"\\]|\\.|"[^"]|""[^"\\])*"##,
+        unterminated_string,
+        priority = 1
+    )]
+    UnterminatedString(Location),
 
     #[regex(r"[a-zA-Z][a-zA-Z0-9_\-]*", |x| {
         (base_callback(x), x.slice().to_string()) }, priority = 5
@@ -290,6 +329,11 @@ impl Token {
             | Self::LabelIdentifier((source, ..))
             | Self::ByteString((source, ..))
             | Self::String((source, ..))
+            | Self::DQString((source, ..))
+            | Self::TripleString((source, ..))
+            | Self::FString((source, ..))
+            | Self::FTripleString((source, ..))
+            | Self::UnterminatedString(source)
             | Self::Identifier((source, ..))
             | Self::ControlIdentifier((source, ..))
             | Self::Version((source, ..))
@@ -360,6 +404,11 @@ impl Token {
             (Self::Float((_, float1)), Self::Float((_, float2))) => float1 == float2,
             (Self::ByteString((_, bytes1)), Self::ByteString((_, bytes2))) => bytes1 == bytes2,
             (Self::String((_, str1)), Self::String((_, str2))) => str1 == str2,
+            (Self::DQString((_, str1)), Self::DQString((_, str2))) => str1 == str2,
+            (Self::TripleString((_, str1)), Self::TripleString((_, str2))) => str1 == str2,
+            (Self::FString((_, str1)), Self::FString((_, str2))) => str1 == str2,
+            (Self::FTripleString((_, str1)), Self::FTripleString((_, str2))) => str1 == str2,
+            (Self::UnterminatedString(_), Self::UnterminatedString(_)) => true,
             (Self::Identifier((_, id1)), Self::Identifier((_, id2))) => id1 == id2,
             (Self::LegacyMacro(_), Self::LegacyMacro(_)) => true,
             (Self::LabelIdentifier((_, id1)), Self::LabelIdentifier((_, id2))) => id1 == id2,
@@ -472,6 +521,123 @@ fn quote_string(lexer: &mut Lexer<Token>) -> (Location, String) {
         slice
     };
     (base_callback(lexer), unescape(inner))
+}
+
+/// Strips the optional `f` prefix and `count` quote delimiters from both
+/// ends of a raw string token's slice.
+fn strip_string_delimiters(slice: &str, count: usize) -> &str {
+    let slice = slice.strip_prefix('f').unwrap_or(slice);
+    let delimiter = "\"".repeat(count);
+    let inner = slice.strip_prefix(&delimiter).unwrap_or(slice);
+    inner.strip_suffix(&delimiter).unwrap_or(inner)
+}
+
+/// Captures the raw content of a single-line `"..."` / `f"..."` token.
+fn raw_string(lexer: &mut Lexer<Token>) -> (Location, String) {
+    let inner = strip_string_delimiters(lexer.slice(), 1).to_string();
+    (base_callback(lexer), inner)
+}
+
+/// Captures the raw content of a multiline `"""..."""` / `f"""..."""`
+/// token and keeps line/column tracking accurate across embedded newlines.
+fn raw_multiline_string(lexer: &mut Lexer<Token>) -> (Location, String) {
+    let slice = lexer.slice();
+    let inner = strip_string_delimiters(slice, 3).to_string();
+    // Compute this token's location before advancing the line/column state.
+    let location = base_callback(lexer);
+    let span = lexer.span();
+    lexer.extras.line += slice.matches('\n').count();
+    // Keep `span.start - extras.column` a valid in-line column for the next
+    // token: point extras.column at the last newline inside the string.
+    let after_last_newline = match slice.rfind('\n') {
+        Some(pos) => slice.len() - pos - 1,
+        None => slice.len(),
+    };
+    lexer.extras.column = span.end.saturating_sub(after_last_newline);
+    (location, inner)
+}
+
+/// Reports an unterminated string literal with its source location.
+fn unterminated_string(lexer: &mut Lexer<Token>) -> Result<Location> {
+    let location = base_callback(lexer);
+    error::UnterminatedStringSnafu {
+        location: location.clone(),
+    }
+    .fail()
+}
+
+/// Resolves escapes under the documented strict rules for double-quoted
+/// string forms: `\\"`, `\\\\`, `\\n`, `\\r`, `\\t`, `\\b`, `\\f`, and
+/// `\\u{HEX}` (1-6 hex digits, a valid Unicode scalar). Any other escape,
+/// a trailing backslash, or an invalid scalar is rejected.
+pub fn unescape_strict(input: &str, location: &Location) -> Result<String> {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        out.push(read_escaped(&mut chars, location)?);
+    }
+    Ok(out)
+}
+
+/// Reads one escaped character from a stream positioned just after the
+/// backslash, applying the documented strict escape rules.
+pub fn read_escaped(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    location: &Location,
+) -> Result<char> {
+    let invalid = |escape: String| -> Result<char> {
+        error::InvalidEscapeSnafu {
+            location: location.clone(),
+            escape,
+        }
+        .fail()
+    };
+    let Some(escaped) = chars.next() else {
+        return invalid("trailing \\ at end of string".to_string());
+    };
+    match escaped {
+        '"' => Ok('"'),
+        '\\' => Ok('\\'),
+        'n' => Ok('\n'),
+        'r' => Ok('\r'),
+        't' => Ok('\t'),
+        'b' => Ok('\u{8}'),
+        'f' => Ok('\u{c}'),
+        'u' => {
+            if chars.peek() != Some(&'{') {
+                return invalid(format!("\\{}", escaped));
+            }
+            chars.next();
+            let mut hex = String::new();
+            let mut closed = false;
+            for _ in 0..6 {
+                match chars.peek() {
+                    Some('}') => {
+                        chars.next();
+                        closed = true;
+                        break;
+                    }
+                    Some(h) if h.is_ascii_hexdigit() => {
+                        hex.push(*h);
+                        chars.next();
+                    }
+                    _ => break,
+                }
+            }
+            if !closed {
+                return invalid(format!("\\u{{{}", hex));
+            }
+            match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                Some(ch) => Ok(ch),
+                None => invalid(format!("\\u{{{}}}", hex)),
+            }
+        }
+        other => invalid(format!("\\{}", other)),
+    }
 }
 
 /// Resolves backslash escape sequences in string literals
@@ -789,17 +955,102 @@ mod test {
             panic!("Expected String token");
         }
 
-        // Test double quoted string
+        // Test double quoted string (raw content; escapes resolved by parser)
         let mut lexer = Token::lexer("\"world\"");
-        if let Token::String((_, value)) = lexer.next().unwrap().unwrap() {
+        if let Token::DQString((_, value)) = lexer.next().unwrap().unwrap() {
             assert_eq!(value, "world");
         } else {
-            panic!("Expected String token");
+            panic!("Expected DQString token");
         }
 
         // Legacy macro string lexes but is rejected with a migration error
         let mut lexer = Token::lexer("m'macro'");
         assert!(matches!(lexer.next(), Some(Ok(Token::LegacyMacro(_)))));
+    }
+
+    #[test]
+    fn test_f_string_tokens() {
+        // Plain f prefix string
+        let mut lexer = Token::lexer("f\"{vars.name}\"");
+        assert!(matches!(
+            lexer.next(),
+            Some(Ok(Token::FString((_, value)))) if value == "{vars.name}"
+        ));
+
+        // Empty f string
+        let mut lexer = Token::lexer("f\"\"");
+        assert!(matches!(lexer.next(), Some(Ok(Token::FString((_, value)))) if value.is_empty()));
+
+        // Bare `f` still lexes as an identifier
+        let mut lexer = Token::lexer("f = 1");
+        assert!(matches!(lexer.next(), Some(Ok(Token::Identifier((_, id)))) if id == "f"));
+    }
+
+    #[test]
+    fn test_multiline_string_tokens() {
+        // Triple-quoted strings may contain quotes and newlines verbatim
+        let mut lexer = Token::lexer("\"\"\"a \"b\" c\"\"\"");
+        assert!(matches!(
+            lexer.next(),
+            Some(Ok(Token::TripleString((_, value)))) if value == "a \"b\" c"
+        ));
+
+        let mut lexer = Token::lexer("f\"\"\"\nx\n\"\"\"");
+        assert!(matches!(
+            lexer.next(),
+            Some(Ok(Token::FTripleString((_, value)))) if value == "\nx\n"
+        ));
+
+        // An empty single-line string must not be confused with a triple
+        // quote, and adjacent empty strings lex separately
+        let mut lexer = Token::lexer("\"\" \"\"");
+        assert!(matches!(lexer.next(), Some(Ok(Token::DQString((_, v)))) if v.is_empty()));
+        assert!(matches!(lexer.next(), Some(Ok(Token::DQString((_, v)))) if v.is_empty()));
+    }
+
+    #[test]
+    fn test_unterminated_string_errors() {
+        let cases = [
+            "\"no close",
+            "f\"no close",
+            "\"\"\"no close",
+            "f\"\"\"no close",
+            "\"ends with backslash \\",
+        ];
+        for input in cases {
+            let mut lexer = Token::lexer(input);
+            let outcome = lexer.next();
+            assert!(
+                matches!(&outcome, Some(Err(_)))
+                    || matches!(&outcome, Some(Ok(Token::UnterminatedString(_)))),
+                "expected unterminated-string failure for {input:?}, got {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_strict_unescape_rules() {
+        use super::{read_escaped, unescape_strict};
+        use crate::ast::Location;
+
+        let location = Location::new(0, 0);
+        assert_eq!(
+            unescape_strict("a\\\"b\\\\c\\nd\\te", &location).unwrap(),
+            "a\"b\\c\nd\te"
+        );
+        assert_eq!(
+            unescape_strict("\\u{41}\\u{1F600}", &location).unwrap(),
+            "A😀"
+        );
+        assert!(unescape_strict("\\q", &location).is_err());
+        assert!(unescape_strict("trailing \\", &location).is_err());
+        assert!(unescape_strict("\\u{110000}", &location).is_err());
+        assert!(unescape_strict("\\u{FFFFFFFFFF}", &location).is_err());
+        assert!(unescape_strict("\\uZZ}", &location).is_err());
+
+        // read_escaped shares the same rules, char by char
+        let mut chars = "n".chars().peekable();
+        assert_eq!(read_escaped(&mut chars, &location).unwrap(), '\n');
     }
 
     #[test]

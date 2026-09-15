@@ -54,6 +54,14 @@ pub enum Error {
     Deserialize { source: crate::de::error::Error },
     #[snafu(display("{location} - unexpected end of file"))]
     Eof { location: Location },
+    #[snafu(display(
+        "{location} - interpolation type error: values of type '{kind}' cannot be interpolated into a string"
+    ))]
+    InterpolationType { location: Location, kind: ValueType },
+    #[snafu(display("{location} - invalid escape sequence in string literal: '{escape}'"))]
+    InvalidEscape { location: Location, escape: String },
+    #[snafu(display("{location} - malformed interpolation placeholder: {reason}"))]
+    Placeholder { location: Location, reason: String },
     #[snafu(display("{location} - syntax error: expected {expected}, found {got}\n{context}"))]
     Expected {
         location: Location,
@@ -121,6 +129,8 @@ pub enum Error {
     },
     #[snafu(transparent)]
     Serialize { source: crate::ser::error::Error },
+    #[snafu(display("{location} - unterminated string literal"))]
+    UnterminatedString { location: Location },
     #[snafu(display("unknown error occurred"))]
     #[default]
     Unknown,

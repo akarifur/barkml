@@ -1,4 +1,4 @@
-use super::types::{Metadata, ValueType};
+use super::types::{Location, Metadata, ValueType};
 use crate::error;
 use base64::Engine;
 use indexmap::IndexMap;
@@ -6,6 +6,16 @@ use serde::{Deserialize, Serialize};
 use snafu::OptionExt;
 use std::fmt;
 use uuid::Uuid;
+
+/// One fragment of an interpolated (`f"..."`) string.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub enum TemplatePart {
+    /// Literal text fragment with escapes already resolved
+    Literal(String),
+    /// Interpolation placeholder holding a root-relative reference path
+    /// and the source location of the placeholder for diagnostics
+    Placeholder(Vec<super::scope::Segment>, Location),
+}
 
 /// Stores the actual in-memory data for a value in BarkML
 ///
@@ -59,6 +69,8 @@ pub enum Data {
     Require(semver::VersionReq),
     /// Reference expression (`vars.editor`, `app["a.b"].enabled`)
     Reference(Vec<super::scope::Segment>),
+    /// Interpolated string (`f"{vars.editor}.toml"`) pending resolution
+    Template(Vec<TemplatePart>),
     /// Symbol identifier (:symbol)
     Symbol(String),
     /// Null value
@@ -94,6 +106,7 @@ impl Data {
             Data::Version(_) => ValueType::Version,
             Data::Require(_) => ValueType::Require,
             Data::Reference(_) => ValueType::Reference,
+            Data::Template(_) => ValueType::Template,
             Data::Symbol(_) => ValueType::Symbol,
             Data::Null => ValueType::Null,
             Data::Array(values) => ValueType::Array(values.iter().map(|x| x.type_of()).collect()),
@@ -154,6 +167,10 @@ impl Data {
             Data::Reference(segments) => {
                 segments.iter().map(std::mem::size_of_val).sum::<usize>()
                     + std::mem::size_of::<Vec<super::scope::Segment>>()
+            }
+            Data::Template(parts) => {
+                parts.iter().map(std::mem::size_of_val).sum::<usize>()
+                    + std::mem::size_of::<Vec<TemplatePart>>()
             }
             _ => std::mem::size_of_val(self),
         }
@@ -220,10 +237,54 @@ impl Value {
         self.data.memory_size() + std::mem::size_of::<Uuid>() + std::mem::size_of::<Metadata>()
     }
 
+    /// Renders a resolved value for interpolation into an `f"..."` string.
+    ///
+    /// Scalars render as canonical text (numeric values without a width
+    /// suffix); arrays, tables, bytes, and symbols are rejected until an
+    /// explicit rendering/encoding policy exists for them.
+    pub fn render_scalar(&self, location: &Location) -> crate::Result<String> {
+        match &self.data {
+            Data::String(value) => Ok(value.clone()),
+            Data::Bool(value) => Ok(if *value { "true" } else { "false" }.to_string()),
+            Data::Null => Ok("null".to_string()),
+            Data::Version(value) => Ok(value.to_string()),
+            Data::Require(value) => Ok(value.to_string()),
+            Data::Signed(value) => Ok(value.to_string()),
+            Data::I8(value) => Ok(value.to_string()),
+            Data::I16(value) => Ok(value.to_string()),
+            Data::I32(value) => Ok(value.to_string()),
+            Data::I64(value) => Ok(value.to_string()),
+            Data::I128(value) => Ok(value.to_string()),
+            Data::Unsigned(value) => Ok(value.to_string()),
+            Data::U8(value) => Ok(value.to_string()),
+            Data::U16(value) => Ok(value.to_string()),
+            Data::U32(value) => Ok(value.to_string()),
+            Data::U64(value) => Ok(value.to_string()),
+            Data::U128(value) => Ok(value.to_string()),
+            Data::Float(value) => Ok(value.to_string()),
+            Data::F32(value) => Ok(value.to_string()),
+            Data::F64(value) => Ok(value.to_string()),
+            data => error::InterpolationTypeSnafu {
+                location: location.clone(),
+                kind: data.type_of(),
+            }
+            .fail(),
+        }
+    }
+
     /// Converts this value to an interpolation-friendly string representation
     pub fn to_macro_string(&self) -> String {
         match &self.data {
             Data::Reference(segments) => super::scope::Segment::display_path(segments),
+            Data::Template(parts) => parts
+                .iter()
+                .map(|part| match part {
+                    TemplatePart::Literal(text) => text.clone(),
+                    TemplatePart::Placeholder(segments, _) => {
+                        format!("{{{}}}", display_placeholder(segments))
+                    }
+                })
+                .collect(),
             Data::Symbol(value) | Data::String(value) => value.clone(),
             Data::Array(array) => array
                 .iter()
@@ -331,6 +392,13 @@ value_methods!(
     as_reference_mut,
     Vec<super::scope::Segment>,
     Reference
+);
+value_methods!(
+    new_template,
+    as_template,
+    as_template_mut,
+    Vec<TemplatePart>,
+    Template
 );
 value_methods!(new_symbol, as_symbol, as_symbol_mut, String, Symbol);
 value_methods!(new_array, as_array, as_array_mut, Vec<Value>, Array);
@@ -468,6 +536,50 @@ impl<'a> TryFrom<&'a Value> for IndexMap<String, Value> {
     }
 }
 
+/// Escapes a string for emission inside a double-quoted BarkML literal.
+pub fn escape_string(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Renders a placeholder path for an `f"..."` literal. Quoted selectors
+/// use single quotes because a double quote would end the outer literal.
+pub fn display_placeholder(segments: &[super::scope::Segment]) -> String {
+    let mut out = String::new();
+    for segment in segments {
+        match segment {
+            super::scope::Segment::Id(value) => {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push_str(value);
+            }
+            super::scope::Segment::Key(value) => {
+                out.push_str(&format!("['{}']", value));
+            }
+            super::scope::Segment::Label(value) => {
+                out.push_str(&format!("['{}']", value));
+            }
+            super::scope::Segment::Index(index) => {
+                out.push_str(&format!("[{}]", index));
+            }
+        }
+    }
+    out
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Write comment if present
@@ -482,7 +594,7 @@ impl fmt::Display for Value {
 
         // Write the actual value
         match &self.data {
-            Data::String(value) => write!(f, "'{}'", value),
+            Data::String(value) => write!(f, "\"{}\"", escape_string(value)),
             Data::Signed(value) => write!(f, "{}", value),
             Data::I8(value) => write!(f, "{}i8", value),
             Data::I16(value) => write!(f, "{}i16", value),
@@ -506,6 +618,22 @@ impl fmt::Display for Value {
             ),
             Data::Reference(segments) => {
                 write!(f, "{}", super::scope::Segment::display_path(segments))
+            }
+            Data::Template(parts) => {
+                write!(f, "f\"")?;
+                for part in parts {
+                    match part {
+                        TemplatePart::Literal(text) => write!(
+                            f,
+                            "{}",
+                            escape_string(text).replace('{', "{{").replace('}', "}}")
+                        )?,
+                        TemplatePart::Placeholder(segments, _) => {
+                            write!(f, "{{{}}}", display_placeholder(segments))?
+                        }
+                    }
+                }
+                write!(f, "\"")
             }
             Data::Symbol(value) => write!(f, ":{}", value),
             Data::Null => write!(f, "null"),

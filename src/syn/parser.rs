@@ -1,13 +1,222 @@
 use super::lexer::{HashableFloat, Integer, Token};
 use super::read::{Read, TokenReader};
-use crate::ast::{Data, Location, Metadata, Segment, Statement, Value, ValueType};
+use crate::ast::{Data, Location, Metadata, Segment, Statement, TemplatePart, Value, ValueType};
 use crate::{Result, error};
 use indexmap::IndexMap;
 use logos::Lexer;
 use snafu::{OptionExt, ensure};
+use std::iter::Peekable;
 
 /// Maximum recursion depth to prevent stack overflow attacks
 const MAX_RECURSION_DEPTH: usize = 64;
+
+/// Converts a literal string token in identifier/key/label position into
+/// its text. Double-quoted forms are validated strictly; interpolated
+/// strings are rejected because the text must be known at parse time.
+fn literal_string_text(token: &Token, module: &str) -> Result<String> {
+    match token {
+        Token::String((_, text)) => Ok(text.clone()),
+        Token::DQString((location, text)) | Token::TripleString((location, text)) => {
+            let mut location = location.clone();
+            location.set_module(module);
+            super::lexer::unescape_strict(text, &location)
+        }
+        Token::FString((location, _)) | Token::FTripleString((location, _)) => {
+            let mut location = location.clone();
+            location.set_module(module);
+            error::PlaceholderSnafu {
+                location,
+                reason: "interpolated strings are not allowed as identifiers, keys, or labels"
+                    .to_string(),
+            }
+            .fail()
+        }
+        got => error::ExpectedSnafu {
+            location: got.location(Some(module.to_string())),
+            expected: "literal string".to_string(),
+            got: got.clone(),
+            context: "expected a literal string".to_string(),
+        }
+        .fail(),
+    }
+}
+
+/// Parses the raw content of an `f"..."` string into literal fragments and
+/// reference placeholders. `{{`/`}}` render literal braces; escapes follow
+/// the strict double-quoted rules; placeholders use the same root-relative
+/// path grammar as reference expressions, with single-quoted selectors.
+fn parse_template(content: &str, location: &Location) -> Result<Vec<TemplatePart>> {
+    let mut parts = Vec::new();
+    let mut literal = String::new();
+    let mut chars = content.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => literal.push(super::lexer::read_escaped(&mut chars, location)?),
+            '{' => {
+                if chars.peek() == Some(&'{') {
+                    chars.next();
+                    literal.push('{');
+                } else {
+                    if !literal.is_empty() {
+                        parts.push(TemplatePart::Literal(std::mem::take(&mut literal)));
+                    }
+                    let segments = parse_placeholder(&mut chars, location)?;
+                    let mut placeholder_location = location.clone();
+                    placeholder_location.source_text =
+                        Some(format!("{{{}}}", Segment::display_path(&segments)));
+                    parts.push(TemplatePart::Placeholder(segments, placeholder_location));
+                }
+            }
+            '}' => {
+                if chars.peek() == Some(&'}') {
+                    chars.next();
+                    literal.push('}');
+                } else {
+                    return error::PlaceholderSnafu {
+                        location: location.clone(),
+                        reason:
+                            "unmatched '}' in interpolated string; use '}}' for a literal brace"
+                                .to_string(),
+                    }
+                    .fail();
+                }
+            }
+            c => literal.push(c),
+        }
+    }
+
+    if !literal.is_empty() {
+        parts.push(TemplatePart::Literal(literal));
+    }
+    Ok(parts)
+}
+
+fn parse_placeholder(
+    chars: &mut Peekable<std::str::Chars<'_>>,
+    location: &Location,
+) -> Result<Vec<Segment>> {
+    let invalid = |reason: &str| -> Result<Vec<Segment>> {
+        error::PlaceholderSnafu {
+            location: location.clone(),
+            reason: reason.to_string(),
+        }
+        .fail()
+    };
+
+    let head = read_placeholder_identifier(chars, location)?;
+    let mut segments = vec![Segment::Id(head)];
+
+    loop {
+        match chars.peek() {
+            Some('.') => {
+                chars.next();
+                let id = read_placeholder_identifier(chars, location)?;
+                segments.push(Segment::Id(id));
+            }
+            Some('[') => {
+                chars.next();
+                let mut keys: Vec<String> = Vec::new();
+                let mut index: Option<usize> = None;
+                loop {
+                    match chars.peek() {
+                        Some(']') => {
+                            chars.next();
+                            break;
+                        }
+                        Some(',') => {
+                            chars.next();
+                        }
+                        Some('\'') => {
+                            chars.next();
+                            let mut key = String::new();
+                            loop {
+                                match chars.next() {
+                                    Some('\\') => {
+                                        key.push(super::lexer::read_escaped(chars, location)?)
+                                    }
+                                    Some('\'') => break,
+                                    Some(c) => key.push(c),
+                                    None => {
+                                        return invalid(
+                                            "unterminated quoted selector in placeholder",
+                                        );
+                                    }
+                                }
+                            }
+                            keys.push(key);
+                        }
+                        Some(d) if d.is_ascii_digit() => {
+                            if index.is_some() {
+                                return invalid("multiple array indices in one selector");
+                            }
+                            let mut digits = String::new();
+                            while let Some(d) = chars.peek() {
+                                if d.is_ascii_digit() {
+                                    digits.push(*d);
+                                    chars.next();
+                                } else {
+                                    break;
+                                }
+                            }
+                            index =
+                                Some(digits.parse().map_err(|_| error::Error::Placeholder {
+                                    location: location.clone(),
+                                    reason: format!("invalid array index '{}'", digits),
+                                })?);
+                        }
+                        _ => return invalid("expected quoted selector or array index"),
+                    }
+                }
+                if !keys.is_empty() && index.is_some() {
+                    return invalid("cannot mix quoted selectors and numeric indices");
+                }
+                if keys.is_empty() && index.is_none() {
+                    return invalid("empty selector");
+                }
+                if let Some(index) = index {
+                    segments.push(Segment::Index(index));
+                } else {
+                    segments.extend(keys.into_iter().map(Segment::Key));
+                }
+            }
+            Some('}') => {
+                chars.next();
+                return Ok(segments);
+            }
+            _ => return invalid("expected '.', '[', or '}' in placeholder"),
+        }
+    }
+}
+
+fn read_placeholder_identifier(
+    chars: &mut Peekable<std::str::Chars<'_>>,
+    location: &Location,
+) -> Result<String> {
+    let mut id = String::new();
+    match chars.peek() {
+        Some(c) if c.is_ascii_alphabetic() => {
+            id.push(*c);
+            chars.next();
+        }
+        _ => {
+            return error::PlaceholderSnafu {
+                location: location.clone(),
+                reason: "placeholder path must start with an identifier".to_string(),
+            }
+            .fail();
+        }
+    }
+    while let Some(c) = chars.peek() {
+        if c.is_ascii_alphanumeric() || *c == '_' || *c == '-' {
+            id.push(*c);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    Ok(id)
+}
 
 pub struct Parser<'source> {
     tokens: TokenReader<'source>,
@@ -214,8 +423,13 @@ impl<'source> Parser<'source> {
                                 location: self.tokens.location(),
                             })?;
                             let id = match id {
-                                Token::Identifier((_, id)) | Token::String((_, id)) => {
-                                    Ok(id.clone())
+                                Token::Identifier((_, id)) => Ok(id.clone()),
+                                t @ (Token::String(..)
+                                | Token::DQString(..)
+                                | Token::TripleString(..)
+                                | Token::FString(..)
+                                | Token::FTripleString(..)) => {
+                                    literal_string_text(&t, &self.tokens.module_name.clone())
                                 }
                                 got => error::ExpectedSnafu {
                                     location: got.location(Some(self.tokens.module_name.clone())),
@@ -310,6 +524,8 @@ impl<'source> Parser<'source> {
                             Token::RBracket(_) => break,
                             Token::Comma(_) => continue,
                             Token::String((_, key)) => keys.push(key),
+                            t @ (Token::DQString(..) | Token::TripleString(..)) => keys
+                                .push(literal_string_text(&t, &self.tokens.module_name.clone())?),
                             Token::Int((_, Integer::Unsigned(value))) if index.is_none() => {
                                 index = Some(value as usize);
                             }
@@ -430,6 +646,18 @@ impl<'source> Parser<'source> {
             Token::String((_, value)) => {
                 Ok((Value::new_string(value.clone(), meta), ValueType::String))
             }
+            Token::DQString((location, value)) | Token::TripleString((location, value)) => {
+                let mut loc = location.clone();
+                loc.set_module(self.tokens.module_name.as_str());
+                let text = super::lexer::unescape_strict(&value, &loc)?;
+                Ok((Value::new_string(text, meta), ValueType::String))
+            }
+            Token::FString((location, value)) | Token::FTripleString((location, value)) => {
+                let mut loc = location.clone();
+                loc.set_module(self.tokens.module_name.as_str());
+                let parts = parse_template(&value, &loc)?;
+                Ok((Value::new_template(parts, meta), ValueType::Template))
+            }
             Token::SymbolIdentifier((_, value)) => {
                 Ok((Value::new_symbol(value.clone(), meta), ValueType::Symbol))
             }
@@ -493,17 +721,32 @@ impl<'source> Parser<'source> {
                             self.tokens.discard();
                             break;
                         }
-                        Token::Identifier(_) | Token::String(_) => {
+                        Token::Identifier(_)
+                        | Token::String(_)
+                        | Token::DQString(_)
+                        | Token::TripleString(_)
+                        | Token::FString(_)
+                        | Token::FTripleString(_) => {
                             let next_token = self.tokens.next()?.context(error::EofSnafu {
                                 location: self.tokens.location(),
                             })?;
 
                             let id = match next_token {
-                                Token::Identifier((location, id))
-                                | Token::String((location, id)) => {
+                                Token::Identifier((location, id)) => {
                                     let mut loc = location.clone();
                                     loc.set_module(self.tokens.module_name.as_str());
                                     (loc, id.clone())
+                                }
+                                t @ (Token::String(..)
+                                | Token::DQString(..)
+                                | Token::TripleString(..)
+                                | Token::FString(..)
+                                | Token::FTripleString(..)) => {
+                                    let mut loc = t.location(Some(self.tokens.module_name.clone()));
+                                    loc.set_module(self.tokens.module_name.as_str());
+                                    let text =
+                                        literal_string_text(&t, &self.tokens.module_name.clone())?;
+                                    (loc, text)
                                 }
                                 _ => unreachable!(), // We already matched this in the peek
                             };
@@ -624,9 +867,17 @@ impl<'source> Parser<'source> {
                 Ok(Statement::new_control(id.as_str(), type_, value, meta)?)
             }
 
-            Token::Identifier((location, id)) | Token::String((location, id)) => {
-                let mut loc = location.clone();
-                loc.set_module(self.tokens.module_name.as_str());
+            t @ (Token::Identifier(..)
+            | Token::String(..)
+            | Token::DQString(..)
+            | Token::TripleString(..)
+            | Token::FString(..)
+            | Token::FTripleString(..)) => {
+                let loc = t.location(Some(self.tokens.module_name.clone()));
+                let id = match &t {
+                    Token::Identifier((_, id)) | Token::String((_, id)) => id.clone(),
+                    _ => literal_string_text(t, &self.tokens.module_name.clone())?,
+                };
 
                 // Check if this is an assignment or a block
                 if let Some(token) = self.tokens.peek()? {
@@ -689,11 +940,20 @@ impl<'source> Parser<'source> {
                                         self.tokens.discard();
                                         break;
                                     }
-                                    Some(Token::String((loc, label))) => {
-                                        let value = Value::new(
-                                            Data::String(label),
-                                            Metadata::new(loc.clone()),
-                                        );
+                                    Some(
+                                        t @ (Token::String(..)
+                                        | Token::DQString(..)
+                                        | Token::TripleString(..)
+                                        | Token::FString(..)
+                                        | Token::FTripleString(..)),
+                                    ) => {
+                                        let label = literal_string_text(
+                                            &t,
+                                            &self.tokens.module_name.clone(),
+                                        )?;
+                                        let loc = t.location(Some(self.tokens.module_name.clone()));
+                                        let value =
+                                            Value::new(Data::String(label), Metadata::new(loc));
                                         labels.push(value);
                                         self.tokens.discard();
                                     }

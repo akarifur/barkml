@@ -1,5 +1,5 @@
 use super::types::{StatementType, ValueType};
-use super::{Data, Statement, StatementData, Value};
+use super::{Data, Statement, StatementData, TemplatePart, Value};
 use crate::{Result, error};
 use indexmap::{IndexMap, IndexSet};
 use serde::{Deserialize, Serialize};
@@ -140,7 +140,7 @@ pub struct Scope {
 /// and tables); assignments of such values adopt the resolved target type.
 fn contains_reference_impl(value_type: &ValueType) -> bool {
     match value_type {
-        ValueType::Reference => true,
+        ValueType::Reference | ValueType::Template => true,
         ValueType::Array(children) => children.iter().any(contains_reference_impl),
         ValueType::Table(children) => children.values().any(contains_reference_impl),
         _ => false,
@@ -488,6 +488,52 @@ impl Scope {
         Ok(result)
     }
 
+    /// Resolves an interpolated string: each placeholder is resolved with
+    /// the same reference machinery (cycle, depth, and missing-target
+    /// semantics) and rendered under the scalar-only interpolation policy.
+    /// Targets that are themselves templates resolve recursively; the
+    /// recursion depth guard bounds placeholder cycles.
+    fn resolve_template(
+        &mut self,
+        at: &Value,
+        parts: &[TemplatePart],
+        visit_log: &mut IndexSet<Uuid>,
+    ) -> Result<Value> {
+        ensure!(
+            self.recursion_depth < MAX_RECURSION_DEPTH,
+            error::RecursionLimitSnafu {
+                location: at.meta.location.clone(),
+                limit: MAX_RECURSION_DEPTH,
+            }
+        );
+        self.recursion_depth += 1;
+
+        let mut out = String::new();
+        for part in parts {
+            match part {
+                TemplatePart::Literal(text) => out.push_str(text),
+                TemplatePart::Placeholder(segments, location) => {
+                    let resolved = self.resolve_reference(at, segments, visit_log)?;
+                    // Placeholder targets carry the template's own UID after
+                    // resolution, so the generic resolve_value visit-log check
+                    // would misfire; nested templates recurse here instead.
+                    let rendered = match resolved.data {
+                        Data::Template(nested) => self.resolve_template(at, &nested, visit_log)?,
+                        _ => resolved,
+                    };
+                    out.push_str(&rendered.render_scalar(location)?);
+                }
+            }
+        }
+        self.recursion_depth -= 1;
+
+        Ok(Value {
+            uid: at.uid,
+            data: Data::String(out),
+            meta: at.meta.clone(),
+        })
+    }
+
     /// Resolves all references in a value
     fn resolve_value(&mut self, at: &Value, visit_log: &mut IndexSet<Uuid>) -> Result<Value> {
         let uid = at.uid;
@@ -502,6 +548,7 @@ impl Scope {
 
         let result = match &at.data {
             Data::Reference(segments) => self.resolve_reference(at, segments, visit_log)?,
+            Data::Template(parts) => self.resolve_template(at, parts, visit_log)?,
             Data::Table(children) => {
                 let mut new_children = IndexMap::new();
                 for (key, value) in children.iter() {
@@ -569,7 +616,7 @@ impl Scope {
         let references: Vec<Value> = self
             .symbol_table
             .values()
-            .filter(|value| matches!(value.data, Data::Reference(_)))
+            .filter(|value| matches!(value.data, Data::Reference(_) | Data::Template(_)))
             .cloned()
             .collect();
 
@@ -581,9 +628,16 @@ impl Scope {
         };
 
         for value in references {
-            if let Data::Reference(segments) = &value.data {
-                let mut visit_log = IndexSet::new();
-                scope.resolve_reference(&value, segments, &mut visit_log)?;
+            match &value.data {
+                Data::Reference(segments) => {
+                    let mut visit_log = IndexSet::new();
+                    scope.resolve_reference(&value, segments, &mut visit_log)?;
+                }
+                Data::Template(_) => {
+                    let mut visit_log = IndexSet::new();
+                    scope.resolve_value(&value, &mut visit_log)?;
+                }
+                _ => {}
             }
         }
         Ok(())

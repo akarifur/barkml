@@ -55,6 +55,9 @@ pub enum ValueType {
     /// Reference expression
     Reference,
 
+    /// Interpolated string (`f"..."`) pending resolution
+    Template,
+
     /// Label identifier
     Label,
 
@@ -200,6 +203,7 @@ impl ValueType {
             Self::Bool => TypeCategory::Boolean,
             Self::Version | Self::Require => TypeCategory::Version,
             Self::Reference => TypeCategory::Reference,
+            Self::Template => TypeCategory::Text,
             Self::Label | Self::Symbol => TypeCategory::Identifier,
             Self::Null => TypeCategory::Null,
             Self::Array(_) => TypeCategory::Collection,
@@ -248,6 +252,7 @@ impl fmt::Display for ValueType {
             Self::Version => f.write_str("version"),
             Self::Require => f.write_str("require"),
             Self::Reference => f.write_str("reference"),
+            Self::Template => f.write_str("template"),
             Self::Label => f.write_str("label"),
             Self::Symbol => f.write_str("symbol"),
             Self::Null => f.write_str("null"),

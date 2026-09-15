@@ -178,13 +178,55 @@ You also must always specify a requirement operator in barkml.
 
 ### String Values
 
-Strings can be defined either with a single quote or a double quote. Both are effectively parsed identically.
+Double-quoted strings are the canonical form. They never interpolate: `$HOME`, `${shell_var}`,
+and `{braces}` are preserved literally. Escapes follow the documented rules: `\"`, `\\`, `\n`,
+`\r`, `\t`, `\b`, `\f`, and `\u{HEX}` (1-6 hex digits forming a valid Unicode scalar). Any other
+escape, a trailing backslash, or an unterminated string is a source-aware error.
+
+Triple double quotes form multiline strings. Whitespace is verbatim: no dedenting, no trimming, and
+opening/closing newlines and line endings are preserved exactly. Escapes are processed under the
+same documented rules as single-line strings. A `"` may appear inside; the string ends at the
+first `"""`.
+
+Single-quoted strings remain as a compatibility form with their historical lenient escaping;
+their contents are never interpolated either.
 
 **Examples:**
 
 ```
+"echo $HOME and {name}"
+script = """
+export EDITOR="nvim"
+export PATH="$HOME/.local/bin:$PATH"
+"""
 'my-string'
-"my string value"
+```
+
+### String Interpolation
+
+An `f` prefix explicitly enables interpolation in a double-quoted or multiline string.
+Placeholders use the same root-relative path grammar as reference expressions, including quoted
+selectors (single-quoted inside placeholders, since a double quote would end the literal) and
+array indices. `{{` and `}}` render literal braces in `f` strings; braces need no escaping in
+plain strings.
+
+Scalars interpolate as canonical text: strings as-is, numeric values without a width suffix,
+`true`/`false`/`null`, and SemVer versions and requirements in canonical form. Arrays, tables,
+bytes, and symbols are rejected with a type error. Missing targets, cycles, and depth limits
+behave exactly like ordinary reference expressions.
+
+**Examples:**
+
+```
+host {
+    config_dir = "/etc/host"
+}
+target = f"{host.config_dir}/starship.toml"
+configured_script = f"""
+export EDITOR="{vars.editor}"
+"""
+quoted = f"{app['org.mozilla.firefox'].enabled}"
+braces = f"{{literal}}"
 ```
 
 ### Byte Data
@@ -311,8 +353,11 @@ first = items[0]
 ```
 
 Legacy `m!path` macro references and `m'...'` macro strings were removed; they fail with a
-migration error pointing at the equivalent root-relative reference. String interpolation will
-return as explicit f-strings in a future release.
+migration error pointing at the equivalent root-relative reference. Use `f"..."` strings for
+interpolation: `m'{name}'` becomes `f"{name}"`, and `m!vars.editor` becomes the reference
+expression `vars.editor` (or `f"{vars.editor}"` when a string is wanted). Note that legacy macro
+strings stringified composite values, while `f` strings reject arrays, tables, bytes, and
+symbols by design.
 
 ## Security
 
