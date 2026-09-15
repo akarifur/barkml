@@ -44,6 +44,10 @@ pub enum Error {
     /// Key not found error
     #[snafu(display("key not found: {key}"))]
     KeyNotFound { key: String },
+
+    /// Unresolved reference encountered during deserialization
+    #[snafu(display("unresolved reference: references must be resolved before deserialization"))]
+    UnresolvedReference,
 }
 
 impl de::Error for Error {

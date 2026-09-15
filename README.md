@@ -2,7 +2,7 @@
 
 BarkML is a declarative configuration format that is inspired by other languages shuch as toml, hcl and more. It was
 created initially to be used with operational tools and generative tooling. The language defaults to utf-8 parsing and
-the language supports self-referential macro replacements.
+the language supports self-referential value references.
 
 
 # Language Specification
@@ -279,11 +279,13 @@ BarkML also supports the definition of tables
 }
 ```
 
-## Macro Replacements
+## References
 
-BarkML supports the use of self referential macros. These macros will at parse time lookup and replace
-values with a previously defined value. These macro values must reference data via a root path from the
-top of the configuration file. Macro replacements are full replacements
+BarkML supports self-referential references. At resolution time, references look up and replace
+the value with the referenced value. References are root-relative paths: they resolve from the
+root of the composed configuration, so forward references and reordering are fine, and a
+reference preserves the referenced value's type. `self` and `super` carry no special meaning;
+they are ordinary identifiers under the same root lookup.
 
 **Example:**
 
@@ -293,22 +295,24 @@ section {
     val = 5
 }
 section-b {
-    parent-version = m!version
-    other-val = m!section.val
+    parent-version = version
+    other-val = section.val
 }
 ```
 
-## Macro Strings
-
-BarkML also allows the use of macro replacements inside of a string declaration. A macro string
-can define one or more replacements by utilizing `{}` inside of the string
+Quoted selectors keep punctuation inside a single component, address multi-label blocks, and
+index arrays:
 
 ```
-version = "1.0.0"
-motd = m'Hello from {version}'
+settings = app["org.mozilla.firefox"].settings
+value = vars["key.with.dots"]
+artifact-url = artifact["linux", "aarch64"].url
+first = items[0]
 ```
 
-_NOTE: Macro strings must only use single quotes_
+Legacy `m!path` macro references and `m'...'` macro strings were removed; they fail with a
+migration error pointing at the equivalent root-relative reference. String interpolation will
+return as explicit f-strings in a future release.
 
 ## Security
 

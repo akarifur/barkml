@@ -192,8 +192,15 @@ pub enum Token {
     )]
     Float((Location, HashableFloat)),
 
-    #[regex(r"m'[^']*'", macro_string)]
-    MacroString((Location, String)),
+    #[token(".", base_callback)]
+    Period(Location),
+
+    /// Legacy `m!name` / `m'...'` macro syntax; rejected by the parser with
+    /// a migration error. Kept as a token so the offending source text is
+    /// preserved in the location.
+    #[regex(r"m\![a-zA-Z][a-zA-Z0-9_\-\.]*", legacy_macro, priority = 9)]
+    #[regex(r"m'[^']*'", legacy_macro, priority = 9)]
+    LegacyMacro(Location),
     #[regex(r"b'[-A-Za-z0-9+/]*={0,3}'", byte_string)]
     ByteString((Location, Vec<u8>)),
     #[regex(r"'([^'\\]|\\.)*'", quote_string)]
@@ -204,10 +211,6 @@ pub enum Token {
         (base_callback(x), x.slice().to_string()) }, priority = 5
     )]
     Identifier((Location, String)),
-    #[regex(r"m\![a-zA-Z][a-zA-Z0-9_\-\.]*", |x| {
-        (base_callback(x), x.slice().trim_start_matches("m!").to_string()) }
-    , priority = 6)]
-    MacroIdentifier((Location, String)),
     #[regex(r"\![a-zA-Z][a-zA-Z0-9_\-]*", |x| {
         (base_callback(x), x.slice().trim_start_matches('!').to_string())
     }, priority = 7)]
@@ -283,12 +286,11 @@ impl Token {
             | Self::KeySchema(source)
             | Self::Int((source, ..))
             | Self::Float((source, ..))
-            | Self::MacroString((source, ..))
+            | Self::LegacyMacro(source)
             | Self::LabelIdentifier((source, ..))
             | Self::ByteString((source, ..))
             | Self::String((source, ..))
             | Self::Identifier((source, ..))
-            | Self::MacroIdentifier((source, ..))
             | Self::ControlIdentifier((source, ..))
             | Self::Version((source, ..))
             | Self::Require((source, ..))
@@ -356,11 +358,10 @@ impl Token {
             (Self::KeySchema(_), Self::KeySchema(_)) => true,
             (Self::Int((_, int1)), Self::Int((_, int2))) => int1 == int2,
             (Self::Float((_, float1)), Self::Float((_, float2))) => float1 == float2,
-            (Self::MacroString((_, str1)), Self::MacroString((_, str2))) => str1 == str2,
             (Self::ByteString((_, bytes1)), Self::ByteString((_, bytes2))) => bytes1 == bytes2,
             (Self::String((_, str1)), Self::String((_, str2))) => str1 == str2,
             (Self::Identifier((_, id1)), Self::Identifier((_, id2))) => id1 == id2,
-            (Self::MacroIdentifier((_, id1)), Self::MacroIdentifier((_, id2))) => id1 == id2,
+            (Self::LegacyMacro(_), Self::LegacyMacro(_)) => true,
             (Self::LabelIdentifier((_, id1)), Self::LabelIdentifier((_, id2))) => id1 == id2,
             (Self::SymbolIdentifier((_, id1)), Self::SymbolIdentifier((_, id2))) => id1 == id2,
             (Self::ControlIdentifier((_, id1)), Self::ControlIdentifier((_, id2))) => id1 == id2,
@@ -509,15 +510,8 @@ fn byte_string(lexer: &mut Lexer<Token>) -> Result<(Location, Vec<u8>)> {
     ))
 }
 
-fn macro_string(lexer: &mut Lexer<Token>) -> (Location, String) {
-    let slice = lexer.slice();
-    (
-        base_callback(lexer),
-        slice
-            .trim_start_matches("m'")
-            .trim_end_matches('\'')
-            .to_string(),
-    )
+fn legacy_macro(lexer: &mut Lexer<Token>) -> Location {
+    base_callback(lexer)
 }
 
 fn float(lexer: &mut Lexer<Token>) -> Result<(Location, HashableFloat)> {
@@ -803,13 +797,9 @@ mod test {
             panic!("Expected String token");
         }
 
-        // Test macro string
+        // Legacy macro string lexes but is rejected with a migration error
         let mut lexer = Token::lexer("m'macro'");
-        if let Token::MacroString((_, value)) = lexer.next().unwrap().unwrap() {
-            assert_eq!(value, "macro");
-        } else {
-            panic!("Expected MacroString token");
-        }
+        assert!(matches!(lexer.next(), Some(Ok(Token::LegacyMacro(_)))));
     }
 
     #[test]
@@ -822,13 +812,9 @@ mod test {
             panic!("Expected Identifier token");
         }
 
-        // Test macro identifier
+        // Legacy macro identifier lexes but is rejected with a migration error
         let mut lexer = Token::lexer("m!macro_name");
-        if let Token::MacroIdentifier((_, value)) = lexer.next().unwrap().unwrap() {
-            assert_eq!(value, "macro_name");
-        } else {
-            panic!("Expected MacroIdentifier token");
-        }
+        assert!(matches!(lexer.next(), Some(Ok(Token::LegacyMacro(_)))));
 
         // Test label identifier
         let mut lexer = Token::lexer("!label");

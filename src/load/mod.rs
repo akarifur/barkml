@@ -96,7 +96,7 @@ pub trait Loader {
         // If macro resolution is enabled, validate that all macros can be resolved
         if self.is_resolution_enabled() {
             let scope = Scope::new(&module);
-            scope.validate_macros()?;
+            scope.validate_references()?;
         }
 
         Ok(())

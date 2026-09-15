@@ -75,8 +75,10 @@ pub enum Error {
     },
     #[snafu(display("i/o error occurred during loading: {reason}"))]
     Io { reason: String },
-    #[snafu(display("{location} - infinite loop detected during macro resolution"))]
-    Loop { location: Location },
+    #[snafu(display(
+        "{location} - legacy macro syntax '{form}' was removed; use a root-relative reference instead, e.g. 'vars.editor'"
+    ))]
+    LegacyMacro { location: Location, form: String },
     #[snafu(display("{location} - array index out of bounds: no element at index {index}"))]
     NoElement { location: Location, index: usize },
     #[snafu(display("{location} - field not found: '{field}'"))]
@@ -84,9 +86,20 @@ pub enum Error {
     #[snafu(display("{location} - field '{field}' is not a value"))]
     NoValue { location: Location, field: String },
     #[snafu(display(
-        "{location} - macro resolution failed: could not locate value at path '{path}'"
+        "{location} - reference resolution failed: could not locate value at path '{path}'{}",
+        if available.is_empty() { String::new() } else { format!("; available paths:\n{}", available.join("\n")) }
     ))]
-    NoMacro { location: Location, path: String },
+    UnknownReference {
+        location: Location,
+        path: String,
+        available: Vec<String>,
+    },
+    #[snafu(display("{location} - invalid selector in reference '{path}': {reason}"))]
+    WrongSelector {
+        location: Location,
+        path: String,
+        reason: String,
+    },
     #[snafu(display(
         "missing main module: the standard loader requires at least one main module to load"
     ))]
@@ -99,6 +112,8 @@ pub enum Error {
     RecursionLimit { location: Location, limit: usize },
     #[snafu(display("{location} - invalid semantic version requirement: {reason}"))]
     Require { location: Location, reason: String },
+    #[snafu(display("{location} - infinite loop detected during reference resolution"))]
+    Loop { location: Location },
     #[snafu(display("module not found: could not find file named {name}.bml or directory named {name}.d in any of these paths:\n{}", search_paths.iter().map(|x| x.to_string_lossy().to_string()).collect::<Vec<_>>().join("\n")))]
     Search {
         name: String,

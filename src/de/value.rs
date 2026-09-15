@@ -59,7 +59,7 @@ impl<'de, 'a> Deserializer<'de> for ValueDeserializer<'a> {
             Data::Bytes(bytes) => visitor.visit_bytes(bytes),
             Data::Version(version) => visitor.visit_str(&version.to_string()),
             Data::Require(req) => visitor.visit_str(&req.to_string()),
-            Data::Macro(macro_ref) => visitor.visit_str(macro_ref),
+            Data::Reference(_) => error::UnresolvedReferenceSnafu.fail(),
             Data::Symbol(symbol) => visitor.visit_str(symbol),
         }
     }
@@ -371,7 +371,6 @@ impl<'de, 'a> Deserializer<'de> for ValueDeserializer<'a> {
             Data::String(s) => visitor.visit_str(s),
             Data::Version(v) => visitor.visit_str(&v.to_string()),
             Data::Require(v) => visitor.visit_str(&v.to_string()),
-            Data::Macro(m) => visitor.visit_str(m),
             Data::Symbol(s) => visitor.visit_str(s),
             _ => error::TypeMismatchSnafu {
                 expected: "string",
@@ -522,9 +521,7 @@ impl<'de, 'a> Deserializer<'de> for ValueDeserializer<'a> {
         V: Visitor<'de>,
     {
         match &self.value.data {
-            Data::String(s) | Data::Symbol(s) | Data::Macro(s) => {
-                visitor.visit_enum(s.as_str().into_deserializer())
-            }
+            Data::String(s) | Data::Symbol(s) => visitor.visit_enum(s.as_str().into_deserializer()),
             Data::Table(table) => {
                 if table.len() == 1 {
                     let (key, value) = table.iter().next().expect("table has one entry");

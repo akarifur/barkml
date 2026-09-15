@@ -2,12 +2,12 @@
 //!
 //! BarkML is a declarative configuration format inspired by TOML, HCL, and other configuration languages.
 //! It was created initially to be used with operational tools and generative tooling. The language
-//! defaults to UTF-8 parsing and supports self-referential macro replacements.
+//! defaults to UTF-8 parsing and supports self-referential value references.
 //!
 //! # Features
 //!
 //! - Declarative configuration syntax
-//! - Self-referential macro replacements
+//! - Root-relative reference expressions (`vars.editor`, `app["a.b"].enabled`)
 //! - UTF-8 support by default
 //! - Type-safe value handling
 //! - Comprehensive error reporting

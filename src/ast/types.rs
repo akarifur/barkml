@@ -52,8 +52,8 @@ pub enum ValueType {
     /// Semantic Version Requirement
     Require,
 
-    /// Macro string
-    Macro,
+    /// Reference expression
+    Reference,
 
     /// Label identifier
     Label,
@@ -199,7 +199,7 @@ impl ValueType {
             Self::Bytes => TypeCategory::Binary,
             Self::Bool => TypeCategory::Boolean,
             Self::Version | Self::Require => TypeCategory::Version,
-            Self::Macro => TypeCategory::Macro,
+            Self::Reference => TypeCategory::Reference,
             Self::Label | Self::Symbol => TypeCategory::Identifier,
             Self::Null => TypeCategory::Null,
             Self::Array(_) => TypeCategory::Collection,
@@ -218,7 +218,7 @@ pub enum TypeCategory {
     Binary,
     Boolean,
     Version,
-    Macro,
+    Reference,
     Identifier,
     Null,
     Collection,
@@ -247,7 +247,7 @@ impl fmt::Display for ValueType {
             Self::Bool => f.write_str("bool"),
             Self::Version => f.write_str("version"),
             Self::Require => f.write_str("require"),
-            Self::Macro => f.write_str("macro"),
+            Self::Reference => f.write_str("reference"),
             Self::Label => f.write_str("label"),
             Self::Symbol => f.write_str("symbol"),
             Self::Null => f.write_str("null"),

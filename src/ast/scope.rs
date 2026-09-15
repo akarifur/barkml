@@ -1,54 +1,127 @@
-use super::types::StatementType;
+use super::types::{StatementType, ValueType};
 use super::{Data, Statement, StatementData, Value};
 use crate::{Result, error};
 use indexmap::{IndexMap, IndexSet};
-use snafu::{OptionExt, ensure};
+use serde::{Deserialize, Serialize};
+use snafu::ensure;
 use std::fmt;
 use uuid::Uuid;
 
 /// Maximum recursion depth for macro resolution to prevent infinite loops
 const MAX_RECURSION_DEPTH: usize = 100;
 
-/// A single component of a structured symbol-table path.
+/// A single component of a structured symbol-table path or reference.
 ///
 /// Path components keep block-identity boundaries intact: a block named
 /// `app` labeled `"a.b"` contributes `[Id("app"), Label("a.b")]`, which
 /// is distinct from `app "a" "b"` (`[Id("app"), Label("a"), Label("b")]`).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Segment {
-    /// A statement identifier component
+    /// A statement identifier or table-key component (`vars.editor`)
     Id(String),
     /// A block label component
     Label(String),
+    /// A quoted selector component (`["key.with.dots"]`); matches identifiers
+    /// and labels by exact text without splitting on punctuation
+    Key(String),
+    /// A zero-based array element selector (`items[0]`)
+    Index(usize),
 }
 
 impl Segment {
     /// Returns true if this segment is addressable by the given string
-    /// on the dotted macro-reference surface syntax.
+    /// on the dotted diagnostic surface (text comparison only; used for
+    /// near-miss suggestions, not for resolution).
     pub fn matches(&self, input: &str) -> bool {
         match self {
-            Self::Id(value) | Self::Label(value) => value == input,
+            Self::Id(value) | Self::Label(value) | Self::Key(value) => value == input,
+            Self::Index(value) => value.to_string() == input,
         }
+    }
+
+    /// Returns true if a reference segment can match this symbol-table
+    /// segment. `Key` selectors address both identifiers and labels by exact
+    /// text; `Id` matches identifiers; `Index` matches array elements only.
+    pub fn accepts(&self, selector: &Self) -> bool {
+        match (self, selector) {
+            (Self::Id(a), Self::Id(b) | Self::Key(b))
+            | (Self::Label(a), Self::Label(b) | Self::Key(b)) => a == b,
+            (Self::Index(a), Self::Index(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    /// Renders a reference path in surface syntax: `vars.editor`,
+    /// `app["a.b"].enabled`, `artifact["linux", "aarch64"]`, `items[0]`.
+    /// Consecutive `Label`/`Key` selectors render as one bracket group.
+    pub fn display_path(segments: &[Self]) -> String {
+        let mut out = String::new();
+        let mut bracket: Vec<String> = Vec::new();
+        let flush = |out: &mut String, bracket: &mut Vec<String>| {
+            if !bracket.is_empty() {
+                out.push('[');
+                out.push_str(
+                    &bracket
+                        .drain(..)
+                        .map(|x| format!("\"{}\"", x))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+                out.push(']');
+            }
+        };
+
+        for segment in segments {
+            match segment {
+                Self::Id(value) => {
+                    flush(&mut out, &mut bracket);
+                    if !out.is_empty() {
+                        out.push('.');
+                    }
+                    out.push_str(value);
+                }
+                Self::Label(value) | Self::Key(value) => bracket.push(value.clone()),
+                Self::Index(value) => {
+                    flush(&mut out, &mut bracket);
+                    out.push_str(&format!("[{}]", value));
+                }
+            }
+        }
+        flush(&mut out, &mut bracket);
+        out
     }
 }
 
 impl fmt::Display for Segment {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Self::Id(value) | Self::Label(value) => write!(f, "{}", value),
+            Self::Id(value) | Self::Label(value) | Self::Key(value) => write!(f, "{}", value),
+            Self::Index(value) => write!(f, "{}", value),
         }
     }
 }
 
-/// Scope is used to resolve macros and manage symbol references
+/// Scope is used to resolve reference expressions.
 ///
-/// The Scope struct provides functionality for resolving macro references within a BarkML
-/// document. It builds a symbol table from a root statement (typically a module) and
-/// provides methods to resolve all macro references to their actual values.
+/// The Scope struct builds a symbol table from a root statement (typically a
+/// composed module) and resolves all reference expressions to their target
+/// values. Resolution is root-relative: references never traverse relative
+/// to their own location (`self`/`super` are ordinary identifiers), and
+/// declaration order does not matter. References preserve the target's type
+/// and value, including composite values.
 ///
-/// This is a key part of the BarkML processing pipeline, as it handles the substitution
-/// of macro references with their actual values, allowing for powerful templating and
-/// reuse capabilities in the language.
+/// # Compatibility changes (from macro replacements)
+///
+/// - `Data::Macro` and `ValueType::Macro` were removed in favor of
+///   `Data::Reference(Vec<Segment>)` and `ValueType::Reference`.
+/// - `Scope::lookup` now takes structured `&[Segment]` reference segments
+///   (root-relative) instead of a dotted `&str`; `lookup_segments` still
+///   takes a full symbol-table path including the root segment.
+/// - `Scope::validate_macros` was renamed to `Scope::validate_references`.
+/// - Implicit `self`/`super` relative lookup was removed; legacy `m!path`
+///   and `m'...'` forms fail with a migration error at parse time.
+/// - Array elements are addressed by zero-based index (`items[0]`), not by
+///   legacy dotted numeric paths.
 pub struct Scope {
     /// The root statement (typically a module) that defines the scope
     root: Statement,
@@ -61,6 +134,17 @@ pub struct Scope {
 
     /// Current recursion depth for macro resolution
     recursion_depth: usize,
+}
+
+/// Whether a type contains a reference anywhere (including inside arrays
+/// and tables); assignments of such values adopt the resolved target type.
+fn contains_reference_impl(value_type: &ValueType) -> bool {
+    match value_type {
+        ValueType::Reference => true,
+        ValueType::Array(children) => children.iter().any(contains_reference_impl),
+        ValueType::Table(children) => children.values().any(contains_reference_impl),
+        _ => false,
+    }
 }
 
 impl Scope {
@@ -118,7 +202,7 @@ impl Scope {
             Data::Array(contents) => {
                 for (index, child) in contents.iter().enumerate() {
                     let mut array_path = path.clone();
-                    array_path.push(Segment::Id(index.to_string()));
+                    array_path.push(Segment::Index(index));
                     Self::walk_value(scope, child, array_path);
                 }
             }
@@ -132,24 +216,25 @@ impl Scope {
         scope.path_lookup.insert(node.uid, path);
     }
 
-    /// Finds a symbol table entry addressable by the given dotted path
-    /// components. Both `Id` and `Label` segments match by their string
-    /// value, in path order, so ordered label sequences are addressed
-    /// unambiguously.
-    fn get_by_parts(&self, parts: &[String]) -> Option<&Value> {
+    /// Finds symbol table entries whose path (excluding the root segment)
+    /// is addressable by the given reference segments. Selector kinds are
+    /// enforced: `Key` addresses identifiers and labels, `Index` addresses
+    /// array elements only. Multiple matches indicate an ambiguous selector.
+    fn reference_matches(&self, segments: &[Segment]) -> Vec<&Value> {
         self.symbol_table
             .iter()
-            .find(|(path, _)| {
-                path.len() == parts.len()
-                    && path
+            .filter(|(path, _)| {
+                path.len() == segments.len() + 1
+                    && path[1..]
                         .iter()
-                        .zip(parts)
-                        .all(|(segment, part)| segment.matches(part))
+                        .zip(segments)
+                        .all(|(segment, selector)| segment.accepts(selector))
             })
             .map(|(_, value)| value)
+            .collect()
     }
 
-    /// Applies macro resolution to the entire scope
+    /// Applies reference resolution to the entire scope
     pub fn apply(&mut self) -> Result<Statement> {
         let mut visit_log = IndexSet::new();
         let root = self.root.clone();
@@ -157,69 +242,13 @@ impl Scope {
         self.resolve_statement(&root, &mut visit_log)
     }
 
-    /// Resolves a path reference, handling relative paths like 'self' and 'super'
-    fn resolve_path(&self, current: &Value, input: String) -> Result<Vec<String>> {
-        let operating_path: Vec<String> = if input.starts_with("self") || input.starts_with("super")
-        {
-            let current_path = self
-                .path_lookup
-                .get(&current.uid)
-                .context(error::NoMacroSnafu {
-                    location: current.meta.location.clone(),
-                    path: "unknown".to_string(),
-                })?;
-            let current_path: Vec<String> = current_path
-                .iter()
-                .map(|segment| segment.to_string())
-                .collect();
-
-            if input.starts_with("super") {
-                let mut current_segments = current_path;
-                let new_segments: Vec<&str> = input.split('.').collect();
-
-                // Remove the current segment for 'super'
-                current_segments.pop();
-
-                // Add the remaining path segments
-                for segment in new_segments.iter().skip(1) {
-                    if *segment == "super" {
-                        current_segments.pop();
-                    } else {
-                        current_segments.push(segment.to_string());
-                    }
-                }
-
-                current_segments
-            } else {
-                // Replace 'self' with current path
-                let replaced = input.replace("self", &current_path.join("."));
-                replaced.split('.').map(|x| x.to_string()).collect()
-            }
-        } else {
-            input.split('.').map(|x| x.to_string()).collect()
-        };
-
-        // Normalize the path by handling 'this', 'self', and 'super' references
-        let mut final_path: Vec<String> = Vec::new();
-        for entry in operating_path {
-            match entry.as_str() {
-                "this" | "self" => continue, // Skip these as they're already resolved
-                "super" => {
-                    final_path.pop(); // Go up one level
-                }
-                _ => {
-                    final_path.push(entry);
-                }
-            }
-        }
-
-        Ok(final_path)
-    }
-    /// Resolves a macro reference to its actual value
-    fn resolve_macro(
+    /// Resolves a structured reference to its actual value, preserving the
+    /// target's type and data. All lookups are root-relative; `self`/`super`
+    /// carry no special meaning.
+    fn resolve_reference(
         &mut self,
         at: &Value,
-        input: String,
+        segments: &[Segment],
         visit_log: &mut IndexSet<Uuid>,
     ) -> Result<Value> {
         // Check recursion depth
@@ -232,114 +261,149 @@ impl Scope {
         );
 
         self.recursion_depth += 1;
-        let result = self.resolve_macro_internal(at, input, visit_log);
+        let mut chain_log = IndexSet::new();
+        let result = self.resolve_reference_internal(at, segments, visit_log, &mut chain_log);
         self.recursion_depth -= 1;
         result
     }
 
-    fn resolve_macro_internal(
+    fn resolve_reference_internal(
         &mut self,
         at: &Value,
-        input: String,
+        segments: &[Segment],
         visit_log: &mut IndexSet<Uuid>,
+        chain_log: &mut IndexSet<String>,
     ) -> Result<Value> {
-        // First check if the whole string is a singular reference to a macro value
-        let path = self.resolve_path(at, input.clone())?;
+        // Detect reference cycles across chained hops
+        let display = Segment::display_path(segments);
+        ensure!(
+            chain_log.insert(display),
+            error::LoopSnafu {
+                location: at.meta.location.clone()
+            }
+        );
 
-        if let Some(data) = self.get_by_parts(&path) {
-            let mut resolved_value = Value {
+        let targets: Vec<&Value> = self.reference_matches(segments);
+        if targets.len() > 1 {
+            return error::WrongSelectorSnafu {
+                location: at.meta.location.clone(),
+                path: Segment::display_path(segments),
+                reason: format!("selector matches {} distinct declarations", targets.len()),
+            }
+            .fail();
+        }
+
+        if let Some(target) = targets.first() {
+            let resolved_value = Value {
                 uid: at.uid,
-                data: data.data.clone(),
+                data: target.data.clone(),
                 meta: at.meta.clone(),
             };
 
-            // If the resolved value is still a macro, resolve it recursively
-            if matches!(resolved_value.data, Data::Macro(_)) {
-                resolved_value = self.resolve_value(&resolved_value, visit_log)?;
+            // If the resolved value is itself a reference, resolve it recursively
+            if let Data::Reference(chained) = &resolved_value.data {
+                return self.resolve_reference_internal(at, chained, visit_log, chain_log);
             }
 
-            Ok(resolved_value)
-        } else {
-            // Handle macro string interpolation
-            self.resolve_macro_string(at, input, visit_log)
+            // Composite targets may themselves contain references; resolve
+            // them so no dangling references escape resolution. The copy is
+            // resolved with a fresh visit log since cloned children retain
+            // the target's UIDs; depth and chain guards still bound cycles.
+            if resolved_value.data.is_collection() {
+                let mut fresh_log = IndexSet::new();
+                return self.resolve_value(&resolved_value, &mut fresh_log);
+            }
+
+            return Ok(resolved_value);
         }
+
+        self.reference_failure(at, segments)
     }
 
-    /// Resolves macro string interpolation (e.g., "Hello {name}")
-    fn resolve_macro_string(
-        &mut self,
-        at: &Value,
-        input: String,
-        visit_log: &mut IndexSet<Uuid>,
-    ) -> Result<Value> {
-        // Check if there are any interpolation markers
-        if !input.contains('{') {
-            return error::NoMacroSnafu {
-                location: at.meta.location.clone(),
-                path: input,
+    /// Produces a diagnostic for an unresolvable reference: distinguishes
+    /// wrong selector kinds (quoted key vs array index), out-of-range and
+    /// empty-array indices, and plain missing targets with near-miss paths.
+    fn reference_failure(&self, at: &Value, segments: &[Segment]) -> Result<Value> {
+        let display = Segment::display_path(segments);
+        let location = at.meta.location.clone();
+
+        // Longest kind-aware prefix already resolved
+        let mut deepest: Option<(usize, &Value)> = None;
+        for (path, value) in &self.symbol_table {
+            if path.len() > segments.len() + 1 {
+                continue;
             }
-            .fail();
+            let matched = path[1..]
+                .iter()
+                .zip(segments)
+                .take_while(|(segment, selector)| segment.accepts(selector))
+                .count();
+            if deepest.is_none() || deepest.is_some_and(|(best, _)| matched > best) {
+                deepest = Some((matched, value));
+            }
         }
 
-        let mut result = String::new();
-        let chars = input.chars().peekable();
-        let mut brace_depth = 0;
-        let mut current_macro = String::new();
-
-        for ch in chars {
-            match ch {
-                '{' if brace_depth == 0 => {
-                    brace_depth = 1;
-                    current_macro.clear();
-                }
-                '{' if brace_depth > 0 => {
-                    brace_depth += 1;
-                    current_macro.push(ch);
-                }
-                '}' if brace_depth == 1 => {
-                    // Resolve the macro reference
-                    let path = self.resolve_path(at, current_macro.clone())?;
-                    let resolved_value = self.get_by_parts(&path).context(error::NoMacroSnafu {
-                        location: at.meta.location.clone(),
-                        path: current_macro.clone(),
-                    })?;
-
-                    let mut final_value = resolved_value.clone();
-                    if matches!(final_value.data, Data::Macro(_)) {
-                        final_value = self.resolve_value(&final_value, visit_log)?;
+        if let Some((matched, value)) = deepest {
+            if 0 < matched && matched < segments.len() {
+                let next = &segments[matched];
+                match (&value.data, next) {
+                    (Data::Array(contents), Segment::Index(index)) if *index >= contents.len() => {
+                        return error::NoElementSnafu {
+                            location,
+                            index: *index,
+                        }
+                        .fail();
                     }
-
-                    result.push_str(&final_value.to_macro_string());
-                    brace_depth = 0;
-                    current_macro.clear();
-                }
-                '}' if brace_depth > 1 => {
-                    brace_depth -= 1;
-                    current_macro.push(ch);
-                }
-                _ if brace_depth > 0 => {
-                    current_macro.push(ch);
-                }
-                _ => {
-                    result.push(ch);
+                    (Data::Array(_), Segment::Key(key)) => {
+                        return error::WrongSelectorSnafu {
+                            location,
+                            path: display,
+                            reason: format!(
+                                "quoted selector \"{}\" cannot address an array element; use a numeric index like items[0]",
+                                key
+                            ),
+                        }
+                        .fail();
+                    }
+                    (_, Segment::Index(index)) => {
+                        return error::WrongSelectorSnafu {
+                            location,
+                            path: display,
+                            reason: format!("numeric index [{}] used where no array exists", index),
+                        }
+                        .fail();
+                    }
+                    _ => {}
                 }
             }
         }
 
-        // Check for unclosed braces
-        if brace_depth > 0 {
-            return error::NoMacroSnafu {
-                location: at.meta.location.clone(),
-                path: format!("Unclosed macro reference: {{{}", current_macro),
-            }
-            .fail();
+        error::UnknownReferenceSnafu {
+            location,
+            path: display,
+            available: self.near_misses(segments),
         }
+        .fail()
+    }
 
-        Ok(Value {
-            uid: at.uid,
-            data: Data::String(result),
-            meta: at.meta.clone(),
-        })
+    /// Paths that share a component with the failing reference, capped for
+    /// readable diagnostics.
+    fn near_misses(&self, segments: &[Segment]) -> Vec<String> {
+        let mut misses: Vec<String> = self
+            .symbol_table
+            .keys()
+            .filter(|path| {
+                path.len() > 1
+                    && segments.iter().any(|selector| {
+                        path[1..]
+                            .iter()
+                            .any(|segment| segment.matches(&selector.to_string()))
+                    })
+            })
+            .map(|path| Segment::display_path(&path[1..]))
+            .collect();
+        misses.truncate(20);
+        misses
     }
 
     /// Resolves all macros in a statement
@@ -397,9 +461,12 @@ impl Scope {
                 Statement::new_control(&at.id, Some(expected.clone()), new_value, at.meta.clone())?
             }
             StatementType::Assignment(expected) => {
-                let is_macro = at.get_value().unwrap().as_macro().is_some();
+                // Adopt the resolved target type only when the stored type was
+                // derived from the parsed value (i.e. contains a reference);
+                // declared types stay enforced against the resolved value
+                let adopts_target = contains_reference_impl(expected);
                 let new_value = self.resolve_value(at.get_value().unwrap(), visit_log)?;
-                let expected = if is_macro {
+                let expected = if adopts_target {
                     new_value.type_of()
                 } else {
                     expected.clone()
@@ -421,7 +488,7 @@ impl Scope {
         Ok(result)
     }
 
-    /// Resolves all macros in a value
+    /// Resolves all references in a value
     fn resolve_value(&mut self, at: &Value, visit_log: &mut IndexSet<Uuid>) -> Result<Value> {
         let uid = at.uid;
 
@@ -434,7 +501,7 @@ impl Scope {
         );
 
         let result = match &at.data {
-            Data::Macro(value) => self.resolve_macro(at, value.clone(), visit_log)?,
+            Data::Reference(segments) => self.resolve_reference(at, segments, visit_log)?,
             Data::Table(children) => {
                 let mut new_children = IndexMap::new();
                 for (key, value) in children.iter() {
@@ -474,45 +541,49 @@ impl Scope {
         &self.path_lookup
     }
 
-    /// Looks up a value by its dotted path. Both statement identifiers and
-    /// block labels match by string, in order.
-    pub fn lookup(&self, path: &str) -> Option<&Value> {
-        let parts: Vec<String> = path.split('.').map(|x| x.to_string()).collect();
-        self.get_by_parts(&parts)
+    /// Looks up a value by structured reference segments (root-relative),
+    /// applying the same selector-kind rules as reference resolution.
+    pub fn lookup(&self, segments: &[Segment]) -> Option<&Value> {
+        self.reference_matches(segments).first().copied()
     }
 
-    /// Looks up a value by structured path segments
+    /// Looks up a value by its full structured symbol-table path (including
+    /// the leading root segment).
     pub fn lookup_segments(&self, path: &[Segment]) -> Option<&Value> {
         self.symbol_table.get(path)
     }
 
-    /// Returns all available paths in the symbol table as dotted display
-    /// strings. Note that dotted display is for diagnostics only; two
+    /// Returns all available root-relative paths as display strings.
+    /// Note that dotted display is for diagnostics only; two
     /// distinct structured paths may render identically.
     pub fn available_paths(&self) -> Vec<String> {
         self.symbol_table
             .keys()
-            .map(|path| {
-                path.iter()
-                    .map(|segment| segment.to_string())
-                    .collect::<Vec<_>>()
-                    .join(".")
-            })
+            .filter(|path| path.len() > 1)
+            .map(|path| Segment::display_path(&path[1..]))
             .collect()
     }
 
-    /// Validates that all macro references can be resolved
-    pub fn validate_macros(&self) -> Result<()> {
-        for (_path, value) in &self.symbol_table {
-            if let Data::Macro(macro_ref) = &value.data {
-                let resolved_path = self.resolve_path(value, macro_ref.clone())?;
-                if self.get_by_parts(&resolved_path).is_none() {
-                    return error::NoMacroSnafu {
-                        location: value.meta.location.clone(),
-                        path: macro_ref.clone(),
-                    }
-                    .fail();
-                }
+    /// Validates that all references can be resolved
+    pub fn validate_references(&self) -> Result<()> {
+        let references: Vec<Value> = self
+            .symbol_table
+            .values()
+            .filter(|value| matches!(value.data, Data::Reference(_)))
+            .cloned()
+            .collect();
+
+        let mut scope = Self {
+            root: self.root.clone(),
+            symbol_table: self.symbol_table.clone(),
+            path_lookup: IndexMap::new(),
+            recursion_depth: 0,
+        };
+
+        for value in references {
+            if let Data::Reference(segments) = &value.data {
+                let mut visit_log = IndexSet::new();
+                scope.resolve_reference(&value, segments, &mut visit_log)?;
             }
         }
         Ok(())
@@ -537,7 +608,11 @@ mod tests {
         let scope = Scope::new(&module);
 
         assert!(!scope.symbol_table.is_empty());
-        assert!(scope.lookup("root.test_var").is_some());
+        assert!(
+            scope
+                .lookup(&[Segment::Id("test_var".to_string())])
+                .is_some()
+        );
     }
 
     #[test]
@@ -551,19 +626,20 @@ mod tests {
             Statement::new_assign("target", None, target_value, meta.clone()).unwrap();
         children.insert("target".to_string(), target_stmt);
 
-        // Create a macro that references the target - specify String as expected type
-        let macro_value = Value::new_macro("root.target".to_string(), meta.clone());
-        let macro_stmt =
-            Statement::new_assign("macro_ref", None, macro_value, meta.clone()).unwrap();
-        children.insert("macro_ref".to_string(), macro_stmt);
+        // Create a reference that targets the target value
+        let reference_value =
+            Value::new_reference(vec![Segment::Id("target".to_string())], meta.clone());
+        let reference_stmt =
+            Statement::new_assign("reference", None, reference_value, meta.clone()).unwrap();
+        children.insert("reference".to_string(), reference_stmt);
 
         let module = Statement::new_module("root", children, meta);
         let mut scope = Scope::new(&module);
 
         let resolved = scope.apply().unwrap();
-        let resolved_macro = resolved.find_by_path("macro_ref").unwrap();
+        let resolved_reference = resolved.find_by_path("reference").unwrap();
 
-        if let Some(resolved_value) = resolved_macro.get_value() {
+        if let Some(resolved_value) = resolved_reference.get_value() {
             assert_eq!(resolved_value.as_string(), Some(&"hello".to_string()));
         }
     }
@@ -620,10 +696,31 @@ mod tests {
             .unwrap();
         assert_eq!(split.as_bool(), Some(&false));
 
-        // Dotted surface lookup matches label components in order
+        // Reference lookup matches label components in order via quoted selectors
         assert_eq!(
-            scope.lookup("root.app.a.b.enabled").unwrap().as_bool(),
+            scope
+                .lookup(&[
+                    Segment::Id("app".into()),
+                    Segment::Key("a".into()),
+                    Segment::Key("b".into()),
+                    Segment::Id("enabled".into()),
+                ])
+                .unwrap()
+                .as_bool(),
             Some(&false)
+        );
+
+        // A quoted dotted label stays a single component
+        assert_eq!(
+            scope
+                .lookup(&[
+                    Segment::Id("app".into()),
+                    Segment::Key("a.b".into()),
+                    Segment::Id("enabled".into()),
+                ])
+                .unwrap()
+                .as_bool(),
+            Some(&true)
         );
     }
 }

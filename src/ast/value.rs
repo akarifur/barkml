@@ -57,8 +57,8 @@ pub enum Data {
     Version(semver::Version),
     /// Version requirement (^1.2.3, ~2.0)
     Require(semver::VersionReq),
-    /// Macro reference (m'name' or m!name)
-    Macro(String),
+    /// Reference expression (`vars.editor`, `app["a.b"].enabled`)
+    Reference(Vec<super::scope::Segment>),
     /// Symbol identifier (:symbol)
     Symbol(String),
     /// Null value
@@ -93,7 +93,7 @@ impl Data {
             Data::Bool(_) => ValueType::Bool,
             Data::Version(_) => ValueType::Version,
             Data::Require(_) => ValueType::Require,
-            Data::Macro(_) => ValueType::Macro,
+            Data::Reference(_) => ValueType::Reference,
             Data::Symbol(_) => ValueType::Symbol,
             Data::Null => ValueType::Null,
             Data::Array(values) => ValueType::Array(values.iter().map(|x| x.type_of()).collect()),
@@ -150,7 +150,11 @@ impl Data {
                     + table.capacity()
                         * (std::mem::size_of::<String>() + std::mem::size_of::<Value>())
             }
-            Data::Macro(s) | Data::Symbol(s) => s.capacity() + std::mem::size_of::<String>(),
+            Data::Symbol(s) => s.capacity() + std::mem::size_of::<String>(),
+            Data::Reference(segments) => {
+                segments.iter().map(std::mem::size_of_val).sum::<usize>()
+                    + std::mem::size_of::<Vec<super::scope::Segment>>()
+            }
             _ => std::mem::size_of_val(self),
         }
     }
@@ -216,10 +220,11 @@ impl Value {
         self.data.memory_size() + std::mem::size_of::<Uuid>() + std::mem::size_of::<Metadata>()
     }
 
-    /// Converts this value to a macro string representation
+    /// Converts this value to an interpolation-friendly string representation
     pub fn to_macro_string(&self) -> String {
         match &self.data {
-            Data::Macro(value) | Data::Symbol(value) | Data::String(value) => value.clone(),
+            Data::Reference(segments) => super::scope::Segment::display_path(segments),
+            Data::Symbol(value) | Data::String(value) => value.clone(),
             Data::Array(array) => array
                 .iter()
                 .map(|x| x.to_macro_string())
@@ -320,7 +325,13 @@ value_methods!(
     semver::VersionReq,
     Require
 );
-value_methods!(new_macro, as_macro, as_macro_mut, String, Macro);
+value_methods!(
+    new_reference,
+    as_reference,
+    as_reference_mut,
+    Vec<super::scope::Segment>,
+    Reference
+);
 value_methods!(new_symbol, as_symbol, as_symbol_mut, String, Symbol);
 value_methods!(new_array, as_array, as_array_mut, Vec<Value>, Array);
 value_methods!(new_table, as_table, as_table_mut, IndexMap<String, Value>, Table);
@@ -493,7 +504,9 @@ impl fmt::Display for Value {
                 "b'{}'",
                 base64::engine::general_purpose::STANDARD.encode(value.as_slice())
             ),
-            Data::Macro(value) => write!(f, "m!'{}'", value),
+            Data::Reference(segments) => {
+                write!(f, "{}", super::scope::Segment::display_path(segments))
+            }
             Data::Symbol(value) => write!(f, ":{}", value),
             Data::Null => write!(f, "null"),
             Data::Version(value) => write!(f, "{}", value),

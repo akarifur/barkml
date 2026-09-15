@@ -1,6 +1,6 @@
 use super::lexer::{HashableFloat, Integer, Token};
 use super::read::{Read, TokenReader};
-use crate::ast::{Data, Location, Metadata, Statement, Value, ValueType};
+use crate::ast::{Data, Location, Metadata, Segment, Statement, Value, ValueType};
 use crate::{Result, error};
 use indexmap::IndexMap;
 use logos::Lexer;
@@ -270,9 +270,107 @@ impl<'source> Parser<'source> {
         result
     }
 
+    /// Parses a reference expression: an unquoted root-relative path made of
+    /// dotted identifiers plus bracket selectors — quoted string keys
+    /// (`app["org.mozilla.firefox"]`, `artifact["linux", "aarch64"]`) or a
+    /// single zero-based numeric array index (`items[0]`).
+    fn reference(&mut self, head: String, meta: Metadata) -> Result<(Value, ValueType)> {
+        let mut segments = vec![Segment::Id(head)];
+
+        loop {
+            match self.tokens.peek()? {
+                Some(Token::Period(_)) => {
+                    self.tokens.discard();
+                    let next = self.tokens.next()?.context(error::EofSnafu {
+                        location: self.tokens.location(),
+                    })?;
+                    match next {
+                        Token::Identifier((_, id)) => segments.push(Segment::Id(id)),
+                        got => {
+                            return error::ExpectedSnafu {
+                                location: got.location(Some(self.tokens.module_name.clone())),
+                                expected: "identifier in reference path",
+                                got: got.clone(),
+                                context: "while parsing reference expression".to_string(),
+                            }
+                            .fail();
+                        }
+                    }
+                }
+                Some(Token::LBracket(_)) => {
+                    self.tokens.discard();
+                    let mut keys: Vec<String> = Vec::new();
+                    let mut index: Option<usize> = None;
+
+                    loop {
+                        let token = self.tokens.next()?.context(error::EofSnafu {
+                            location: self.tokens.location(),
+                        })?;
+                        match token {
+                            Token::RBracket(_) => break,
+                            Token::Comma(_) => continue,
+                            Token::String((_, key)) => keys.push(key),
+                            Token::Int((_, Integer::Unsigned(value))) if index.is_none() => {
+                                index = Some(value as usize);
+                            }
+                            Token::Int((_, Integer::Signed(value)))
+                                if value >= 0 && index.is_none() =>
+                            {
+                                index = Some(value as usize);
+                            }
+                            Token::Int((location, _)) => {
+                                return error::WrongSelectorSnafu {
+                                    location,
+                                    path: Segment::display_path(&segments),
+                                    reason: "array indices must be a single non-negative integer"
+                                        .to_string(),
+                                }
+                                .fail();
+                            }
+                            got => {
+                                return error::ExpectedSnafu {
+                                    location: got.location(Some(self.tokens.module_name.clone())),
+                                    expected: "quoted selector or array index",
+                                    got: got.clone(),
+                                    context: "while parsing reference selector".to_string(),
+                                }
+                                .fail();
+                            }
+                        }
+                    }
+
+                    if !keys.is_empty() && index.is_some() {
+                        return error::WrongSelectorSnafu {
+                            location: meta.location.clone(),
+                            path: Segment::display_path(&segments),
+                            reason: "cannot mix quoted selectors and numeric indices".to_string(),
+                        }
+                        .fail();
+                    }
+                    if keys.is_empty() && index.is_none() {
+                        return error::WrongSelectorSnafu {
+                            location: meta.location.clone(),
+                            path: Segment::display_path(&segments),
+                            reason: "empty selector".to_string(),
+                        }
+                        .fail();
+                    }
+
+                    if let Some(index) = index {
+                        segments.push(Segment::Index(index));
+                    } else {
+                        segments.extend(keys.into_iter().map(Segment::Key));
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        Ok((Value::new_reference(segments, meta), ValueType::Reference))
+    }
+
     fn value_impl(&mut self) -> Result<(Value, ValueType)> {
         let meta = self.metadata()?;
-
         let token = self.tokens.next()?.context(error::EofSnafu {
             location: self.tokens.location(),
         })?;
@@ -335,12 +433,14 @@ impl<'source> Parser<'source> {
             Token::SymbolIdentifier((_, value)) => {
                 Ok((Value::new_symbol(value.clone(), meta), ValueType::Symbol))
             }
-            Token::MacroString((_, value)) => {
-                Ok((Value::new_macro(value.clone(), meta), ValueType::Macro))
+            Token::LegacyMacro(location) => error::LegacyMacroSnafu {
+                location: location.clone(),
+                form: location.source_text.clone().unwrap_or_default(),
             }
-            Token::MacroIdentifier((_, value)) => {
-                Ok((Value::new_macro(value.clone(), meta), ValueType::Macro))
-            }
+            .fail(),
+            // Reference expression: unquoted root-relative path with
+            // dot fields, quoted selectors, label selectors, and array indices
+            Token::Identifier((_, head)) => self.reference(head.clone(), meta),
             Token::ByteString((_, value)) => {
                 Ok((Value::new_bytes(value.clone(), meta), ValueType::Bytes))
             }
@@ -711,7 +811,7 @@ impl<'source> Parser<'source> {
 mod test {
     use super::Parser;
     use crate::ast::Metadata;
-    use crate::ast::{Location, Statement, StatementType, Value, ValueType};
+    use crate::ast::{Location, Segment, Statement, StatementType, Value, ValueType};
     use crate::syn::lexer::Token;
     use indexmap::IndexMap;
     use logos::Logos;
@@ -820,17 +920,54 @@ mod test {
                 ),
             ),
             (
-                "m'hello'",
+                "vars.editor",
                 (
-                    Value::new_macro("hello".to_string(), Metadata::default()),
-                    ValueType::Macro,
+                    Value::new_reference(
+                        vec![
+                            Segment::Id("vars".to_string()),
+                            Segment::Id("editor".to_string()),
+                        ],
+                        Metadata::default(),
+                    ),
+                    ValueType::Reference,
                 ),
             ),
             (
-                "m!hello",
+                "app[\"org.mozilla.firefox\"].settings",
                 (
-                    Value::new_macro("hello".to_string(), Metadata::default()),
-                    ValueType::Macro,
+                    Value::new_reference(
+                        vec![
+                            Segment::Id("app".to_string()),
+                            Segment::Key("org.mozilla.firefox".to_string()),
+                            Segment::Id("settings".to_string()),
+                        ],
+                        Metadata::default(),
+                    ),
+                    ValueType::Reference,
+                ),
+            ),
+            (
+                "artifact[\"linux\", \"aarch64\"]",
+                (
+                    Value::new_reference(
+                        vec![
+                            Segment::Id("artifact".to_string()),
+                            Segment::Key("linux".to_string()),
+                            Segment::Key("aarch64".to_string()),
+                        ],
+                        Metadata::default(),
+                    ),
+                    ValueType::Reference,
+                ),
+            ),
+            (
+                "items[0]",
+                (
+                    Value::new_reference(
+                        vec![Segment::Id("items".to_string()), Segment::Index(0)],
+                        Metadata::default(),
+                    ),
+                    ValueType::Reference,
                 ),
             ),
             (
