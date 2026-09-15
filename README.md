@@ -255,47 +255,41 @@ or control statement, but also can be used by themselves as a symbol value.
 
 ### Booleans
 
-BarkML supports the use of multiple identifiers to define boolean values in configuration files
+Booleans have exactly one spelling per value: `true` and `false`.
 
-**Options for True**
+```
+enabled = true
+disabled = false
+```
 
-- true
-- True
-- TRUE
-- yes
-- Yes
-- YES
-- on
-- On
-- ON
-
-**Options for False**
-
-- false
-- False
-- FALSE
-- no
-- No
-- NO
-- off
-- Off
-- OFF
+Former alias spellings (`True`, `TRUE`, `yes`, `on`, `no`, `off`, and case variants) are no
+longer boolean literals. Like any other word, they now lex as identifiers, so in value position
+they are treated as reference expressions; if no such reference exists, resolution fails with an
+error rather than silently producing a boolean. Quoted strings such as `"yes"` or `'on'` are
+unaffected and remain strings.
 
 ## Null
 
-BarkML also supports multiple identifiers to define a null value
+The only null spelling is `null`.
 
-**Options**
+```
+missing = null
+```
 
-- null
-- Null
-- NULL
-- nil
-- Nil
-- NIL
-- none
-- None
-- NONE
+Former aliases (`nil`, `none`, `Null`, `NULL`, and case variants) are now ordinary identifiers,
+same as the removed boolean aliases: they resolve as references or error out, never as null.
+Quoted strings containing these words are unaffected.
+
+## Numeric and version literals (retained)
+
+BarkML deliberately keeps typed numeric and version literals as first-class values; they are not
+reduced to strings:
+
+- Integer suffixes `i8`, `i16`, `i32`, `i64`, `i128`, `u8`, `u16`, `u32`, `u64`, `u128` with
+  their width/sign range checks, plus unsuffixed integers and hexadecimal/octal/binary forms.
+- Float suffixes `f32`, `f64`, and exponent forms.
+- Native SemVer literals (`1.0.0`, `1.2.3-beta.1`) and SemVer requirements (`^1.2`, `>1.1`,
+  `~5.3`) with all supported operators.
 
 ## Arrays
 

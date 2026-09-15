@@ -1100,6 +1100,25 @@ mod test {
                     ValueType::String,
                 ),
             ),
+            // Removed boolean/null aliases parse as references, never as
+            // boolean/null literals.
+            (
+                "yes",
+                (
+                    Value::new_reference(vec![Segment::Id("yes".to_string())], Metadata::default()),
+                    ValueType::Reference,
+                ),
+            ),
+            (
+                "none",
+                (
+                    Value::new_reference(
+                        vec![Segment::Id("none".to_string())],
+                        Metadata::default(),
+                    ),
+                    ValueType::Reference,
+                ),
+            ),
             (
                 ":hello/world",
                 (

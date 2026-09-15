@@ -58,18 +58,8 @@ pub enum Token {
     Error(Location),
 
     #[token("true", base_callback, priority = 11)]
-    #[token("True", base_callback, priority = 11)]
-    #[token("yes", base_callback, priority = 11)]
-    #[token("Yes", base_callback, priority = 11)]
-    #[token("On", base_callback, priority = 11)]
-    #[token("on", base_callback, priority = 11)]
     True(Location),
     #[token("false", base_callback, priority = 11)]
-    #[token("False", base_callback, priority = 11)]
-    #[token("no", base_callback, priority = 11)]
-    #[token("No", base_callback, priority = 11)]
-    #[token("Off", base_callback, priority = 11)]
-    #[token("off", base_callback, priority = 11)]
     False(Location),
 
     #[token("!", base_callback)]
@@ -100,8 +90,6 @@ pub enum Token {
 
     // Keywords
     #[token("null", base_callback, priority = 10)]
-    #[token("nil", base_callback, priority = 10)]
-    #[token("none", base_callback, priority = 10)]
     KeyNull(Location),
     #[token("bool", base_callback, priority = 10)]
     KeyBool(Location),
@@ -263,7 +251,7 @@ pub enum Token {
     )]
     ControlIdentifier((Location, String)),
 
-    #[regex(r"([0-9]+\.){2}[0-9]+([-A-Za-z0-9\.]+)?", version_literal)]
+    #[regex(r"([0-9]+\.){2}[0-9]+([-A-Za-z0-9\.\+]+)?", version_literal)]
     Version((Location, semver::Version)),
 
     #[regex(
@@ -820,21 +808,53 @@ mod test {
 
     #[test]
     fn test_boolean_tokens() {
-        // Test all boolean true variants
+        // Canonical boolean spellings
         assert_single_token("true", Token::True(Location::default()));
-        assert_single_token("True", Token::True(Location::default()));
-        assert_single_token("yes", Token::True(Location::default()));
-        assert_single_token("Yes", Token::True(Location::default()));
-        assert_single_token("on", Token::True(Location::default()));
-        assert_single_token("On", Token::True(Location::default()));
-
-        // Test all boolean false variants
         assert_single_token("false", Token::False(Location::default()));
-        assert_single_token("False", Token::False(Location::default()));
-        assert_single_token("no", Token::False(Location::default()));
-        assert_single_token("No", Token::False(Location::default()));
-        assert_single_token("off", Token::False(Location::default()));
-        assert_single_token("Off", Token::False(Location::default()));
+    }
+
+    #[test]
+    fn test_removed_boolean_aliases_are_identifiers() {
+        for alias in [
+            "True", "yes", "Yes", "tRue", "on", "On", "no", "No", "off", "Off",
+        ] {
+            assert_single_token(
+                alias,
+                Token::Identifier((Location::default(), alias.to_string())),
+            );
+        }
+
+        // Removed null aliases are identifiers too
+        for alias in ["nil", "none", "Null", "NONE"] {
+            assert_single_token(
+                alias,
+                Token::Identifier((Location::default(), alias.to_string())),
+            );
+        }
+
+        // Boundary cases: longer identifiers containing former aliases
+        assert_single_token(
+            "yes_mode",
+            Token::Identifier((Location::default(), "yes_mode".to_string())),
+        );
+        assert_single_token(
+            "offish",
+            Token::Identifier((Location::default(), "offish".to_string())),
+        );
+    }
+
+    #[test]
+    fn test_quoted_boolean_aliases_are_strings() {
+        let mut lexer = Token::lexer("'yes'");
+        match lexer.next().unwrap().unwrap() {
+            Token::String((_, value)) => assert_eq!(value, "yes"),
+            token => panic!("Expected String token, got {:?}", token),
+        }
+        let mut lexer = Token::lexer("\"nil\"");
+        match lexer.next().unwrap().unwrap() {
+            Token::DQString((_, value)) => assert_eq!(value, "nil"),
+            token => panic!("Expected DQString token, got {:?}", token),
+        }
     }
 
     #[test]
@@ -856,8 +876,6 @@ mod test {
     #[test]
     fn test_keyword_tokens() {
         assert_single_token("null", Token::KeyNull(Location::default()));
-        assert_single_token("nil", Token::KeyNull(Location::default()));
-        assert_single_token("none", Token::KeyNull(Location::default()));
         assert_single_token("bool", Token::KeyBool(Location::default()));
         assert_single_token("string", Token::KeyString(Location::default()));
         assert_single_token("int", Token::KeyInt(Location::default()));
@@ -1111,6 +1129,85 @@ mod test {
             assert!(req.to_string().contains("^1.2.3"));
         } else {
             panic!("Expected Require token");
+        }
+
+        // Every supported requirement operator still lexes as a Require token
+        for req in ["=1.2.3", "~5.3", ">1.1", "<2.0.0", "<=1.2", ">=3.0.0"] {
+            let mut lexer = Token::lexer(req);
+            match lexer.next().unwrap() {
+                Ok(Token::Require((_, parsed))) => {
+                    assert!(parsed.to_string().contains(&req[1..]), "{req}");
+                }
+                token => panic!("Expected Require token for {req}, got {:?}", token),
+            }
+        }
+
+        // Prerelease/build versions keep parsing natively
+        let mut lexer = Token::lexer("1.2.3-beta.1");
+        if let Ok(Token::Version((_, version))) = lexer.next().unwrap() {
+            assert_eq!(version.pre.to_string(), "beta.1");
+        } else {
+            panic!("Expected Version token with prerelease");
+        }
+        let mut lexer = Token::lexer("1.2.3+build.7");
+        if let Ok(Token::Version((_, version))) = lexer.next().unwrap() {
+            assert_eq!(version.build.to_string(), "build.7");
+        } else {
+            panic!("Expected Version token with build metadata");
+        }
+    }
+
+    #[test]
+    fn test_integer_width_limits() {
+        // Minimum/maximum values retain their width and type
+        let cases = [
+            ("-128i8", Integer::I8(i8::MIN)),
+            ("127i8", Integer::I8(i8::MAX)),
+            ("-32768i16", Integer::I16(i16::MIN)),
+            ("32767i16", Integer::I16(i16::MAX)),
+            ("-2147483648i32", Integer::I32(i32::MIN)),
+            ("2147483647i32", Integer::I32(i32::MAX)),
+            ("-9223372036854775808i64", Integer::I64(i64::MIN)),
+            ("9223372036854775807i64", Integer::I64(i64::MAX)),
+            (
+                "-170141183460469231731687303715884105728i128",
+                Integer::I128(i128::MIN),
+            ),
+            (
+                "170141183460469231731687303715884105727i128",
+                Integer::I128(i128::MAX),
+            ),
+            ("255u8", Integer::U8(u8::MAX)),
+            ("65535u16", Integer::U16(u16::MAX)),
+            ("4294967295u32", Integer::U32(u32::MAX)),
+            ("18446744073709551615u64", Integer::U64(u64::MAX)),
+            (
+                "340282366920938463463374607431768211455u128",
+                Integer::U128(u128::MAX),
+            ),
+        ];
+        for (input, expected) in cases {
+            let mut lexer = Token::lexer(input);
+            match lexer.next().unwrap() {
+                Ok(Token::Int((_, value))) => assert_eq!(value, expected, "{input}"),
+                token => panic!("Expected Int token for {input}, got {:?}", token),
+            }
+        }
+
+        // Overflow of the suffixed width errors instead of wrapping/narrowing
+        for input in ["128i8", "-129i8", "256u8", "65536u16", "4294967296u32"] {
+            assert!(
+                Token::lexer(input).next().unwrap().is_err(),
+                "Expected overflow error for {input}"
+            );
+        }
+
+        // Invalid signedness errors: negative values into unsigned widths
+        for input in ["-1u8", "-1u64", "-1u128"] {
+            assert!(
+                Token::lexer(input).next().unwrap().is_err(),
+                "Expected signedness error for {input}"
+            );
         }
     }
 
