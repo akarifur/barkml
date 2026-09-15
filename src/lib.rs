@@ -27,6 +27,92 @@
 //!
 //! let statement = from_str(config).expect("Failed to parse BarkML");
 //! ```
+//!
+//! # Embedding BarkML in an application
+//!
+//! BarkML is a reusable configuration language, not an application framework.
+//! The grammar only knows generic blocks, labeled identities, assignments,
+//! tables, arrays, and primitive values. Names like `app`, `file`, `profile`,
+//! `source`, `override`, or `stead` are ordinary identifiers: parsing a document
+//! that uses them selects no profile, merges no override, and runs no provider.
+//! All application semantics — what those names mean, how profiles and
+//! overrides compose, schema validation — belong to the embedding consumer.
+//!
+//! ## Parse unresolved, compose yourself, then resolve
+//!
+//! A consumer can parse input without resolving references, inspect the tree
+//! (labels and source locations are preserved on every node), perform its own
+//! selection and composition, supply explicit context such as host facts, and
+//! only then request generic reference resolution:
+//!
+//! ```rust
+//! use std::io::Cursor;
+//! use barkml::{Loader, Scope, StandardLoader};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let user_config = r#"
+//! app "firefox" {
+//!     enabled = vars.enable_firefox
+//!     channel = >=120.0.0
+//! }
+//! "#;
+//!
+//! let host_facts = r#"
+//! vars {
+//!     enable_firefox = true
+//! }
+//! "#;
+//!
+//! // 1. Parse unresolved: the tree still contains reference expressions.
+//! let mut loader = StandardLoader::default();
+//! loader.skip_macro_resolution()?;
+//!
+//! // 2. Explicit context: the consumer supplies host facts as ordinary
+//! //    assignments. Nothing is discovered from the machine implicitly.
+//! loader.add_module("main", &mut Cursor::new(host_facts.as_bytes()), None)?;
+//! loader.add_module("main", &mut Cursor::new(user_config.as_bytes()), None)?;
+//!
+//! // 3. Inspect before resolving: labels and locations are available for
+//! //    downstream lowering and diagnostics.
+//! let module = loader.read()?;
+//! for (id, labels, block) in module.blocks() {
+//!     let _ = (id, labels, &block.meta.location);
+//! }
+//!
+//! // 4. Generic reference resolution, rooted at the merged document.
+//! let mut scope = Scope::new(&module);
+//! let resolved = scope.apply()?;
+//!
+//! let app = resolved
+//!     .get_child("app", &["firefox"])
+//!     .expect("labeled block is addressable by identity");
+//! let enabled = app
+//!     .find_child("enabled")
+//!     .expect("assignment inside app block")
+//!     .get_value()
+//!     .expect("assignment carries a value");
+//! assert_eq!(enabled.as_bool(), Some(&true));
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Scope of the embedding contract
+//!
+//! - Parsing and generic resolution never discover the OS, fetch secrets,
+//!   invoke commands, or write application configuration. The only I/O
+//!   BarkML performs is the explicit filesystem loading you request through
+//!   [`StandardLoader`].
+//! - There is no network import keyword, no built-in provider vocabulary, and
+//!   no language-level profile/override engine. Module merges happen only when
+//!   you explicitly call loading APIs such as `add_module`; they are a generic
+//!   mechanism, not downstream profile policy.
+//! - Numeric suffixes, native SemVer literals, and requirement literals are
+//!   generic language features available to any consumer.
+//! - Error categories stay distinct: syntax errors (lexing/parsing), type
+//!   errors (assignment compatibility), and reference errors (unresolvable or
+//!   cyclic references) come from BarkML; rejecting an unknown block name or
+//!   an invalid resource shape is downstream schema validation and belongs to
+//!   the consumer.
 
 #![allow(clippy::approx_constant)]
 #![allow(clippy::from_str_radix_10)]
