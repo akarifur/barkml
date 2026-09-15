@@ -7,14 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Features
-
-- [**breaking**] Add explicit f-string interpolation and coherent string model
-
-### Misc.
-
-- *(ci)* Fix changelog for releasing
-
 ## [0.9.0] - 2026-09-15
 
 ### Features
