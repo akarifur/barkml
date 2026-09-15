@@ -463,13 +463,14 @@ fn legacy_macro_forms_fail_with_migration_error() {
 }
 
 #[test]
+#[allow(clippy::approx_constant)]
 fn literals_keep_their_tokenization() {
     // Numeric suffixes, semver, requirements, booleans, and null must not
     // become references
     let module = resolve(
         "settings {
             small = 5u8
-            wide = 1.5f32
+            wide = 3.14f32
             ver = 1.2.3
             req = >=1.2.0
             flag = true
@@ -477,7 +478,7 @@ fn literals_keep_their_tokenization() {
         }",
     );
     assert_eq!(value_of(&module, "settings.small").as_u8(), Some(&5));
-    assert_eq!(value_of(&module, "settings.wide").as_f32(), Some(&1.5f32));
+    assert_eq!(value_of(&module, "settings.wide").as_f32(), Some(&3.14f32));
     assert_eq!(
         value_of(&module, "settings.ver").as_version(),
         Some(&semver::Version::new(1, 2, 3))
