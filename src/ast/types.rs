@@ -293,10 +293,6 @@ impl fmt::Display for ValueType {
 /// Represents the type of a statement in the BarkML language
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize)]
 pub enum StatementType {
-    /// Control statement ($identifier = value)
-    /// Stores the expected type of the value
-    Control(ValueType),
-
     /// Assignment statement (identifier = value)
     /// Stores the expected type of the value
     Assignment(ValueType),
@@ -323,13 +319,13 @@ impl StatementType {
 
     /// Returns true if this statement type represents a value assignment
     pub const fn is_assignment(&self) -> bool {
-        matches!(self, Self::Control(_) | Self::Assignment(_))
+        matches!(self, Self::Assignment(_))
     }
 
     /// Gets the value type for assignment statements, None for containers
     pub fn value_type(&self) -> Option<&ValueType> {
         match self {
-            Self::Control(vt) | Self::Assignment(vt) => Some(vt),
+            Self::Assignment(vt) => Some(vt),
             _ => None,
         }
     }

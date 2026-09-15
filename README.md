@@ -9,26 +9,27 @@ the language supports self-referential value references.
 
 ## Statements
 
-### Control Statements
+### Metadata
 
-Control statements are generally used for specifying metadata related to the file or
-blocks. They are assignment statements to any variable starting with $
-
-**Syntax:**
-
-```
-$<name> = (!<label>)? <value>
-```
+BarkML has no dedicated metadata or control syntax. Metadata is expressed with ordinary
+blocks and assignments, and any schema interpretation belongs to the consuming
+application — BarkML does not include a schema language or validate schemas.
 
 **Example:**
 
 ```
-$control_id = !MyProgram 1.0.0
+stead {
+    schema = 1.0.0
+}
 ```
 
-The above example could be a way to define what schema this barkml utilizes. Note schema
-checking is currently not implemented directly in BarkML, it is on the writer of a tool using
-BarkML to define and check for a schema.
+The block name and fields above are application-defined; BarkML reserves no names for
+this purpose.
+
+> **Migration (from ≤ 0.8.x):** `$` control statements such as `$control_id = !MyProgram 1.0.0`
+> were removed and now produce a parse error. Replace them with ordinary assignments
+> (`control_id = !MyProgram 1.0.0`) or application-defined blocks as shown above. `$`
+> inside string literals is unchanged — strings never interpolate, so `"$HOME"` stays literal.
 
 ### Comments
 

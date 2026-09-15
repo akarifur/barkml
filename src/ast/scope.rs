@@ -446,20 +446,6 @@ impl Scope {
 
                 Statement::new_block(&at.id, new_labels, new_children, at.meta.clone())
             }
-            StatementType::Control(expected) => {
-                let new_value = self.resolve_value(at.get_value().unwrap(), visit_log)?;
-
-                // Validate type compatibility
-                ensure!(
-                    expected.can_assign(&new_value.type_of()),
-                    error::ImplicitConvertSnafu {
-                        left: expected.clone(),
-                        right: new_value.type_of()
-                    }
-                );
-
-                Statement::new_control(&at.id, Some(expected.clone()), new_value, at.meta.clone())?
-            }
             StatementType::Assignment(expected) => {
                 // Adopt the resolved target type only when the stored type was
                 // derived from the parsed value (i.e. contains a reference);

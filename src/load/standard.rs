@@ -540,7 +540,7 @@ mod tests {
             IndexMap::from([
                 (
                     "tire".into(),
-                    Statement::new_control(
+                    Statement::new_assign(
                         "tire",
                         None,
                         Value::new_version(

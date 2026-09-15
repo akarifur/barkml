@@ -1,4 +1,4 @@
-$tire = !Test 1.0.0
+tire = !Test 1.0.0
 section-1 {
   # Documentation
   number = 4

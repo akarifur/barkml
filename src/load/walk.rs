@@ -372,7 +372,6 @@ impl fmt::Display for NodeType {
                 f,
                 "Statement({})",
                 match stmt_type {
-                    crate::StatementType::Control(_) => "Control",
                     crate::StatementType::Assignment(_) => "Assignment",
                     crate::StatementType::Block { .. } => "Block",
                     crate::StatementType::Module(_) => "Module",

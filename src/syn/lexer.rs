@@ -64,8 +64,6 @@ pub enum Token {
 
     #[token("!", base_callback)]
     Exclaim(Location),
-    #[token("$", base_callback)]
-    Dollar(Location),
 
     #[token("[", base_callback)]
     LBracket(Location),
@@ -151,8 +149,6 @@ pub enum Token {
     KeyUse(Location),
     #[token("as", base_callback, priority = 10)]
     KeyAs(Location),
-    #[token("schema", base_callback, priority = 10)]
-    KeySchema(Location),
 
     // Integer
     #[regex(
@@ -246,10 +242,6 @@ pub enum Token {
         (base_callback(x), x.slice().trim_start_matches(':').to_string())
     }, priority = 7)]
     SymbolIdentifier((Location, String)),
-    #[regex(r"\$[a-zA-Z][a-zA-Z0-9_\-]*", |x| {
-        (base_callback(x), x.slice().trim_start_matches('$').to_string()) }, priority = 8
-    )]
-    ControlIdentifier((Location, String)),
 
     #[regex(r"([0-9]+\.){2}[0-9]+([-A-Za-z0-9\.\+]+)?", version_literal)]
     Version((Location, semver::Version)),
@@ -273,7 +265,6 @@ impl Token {
             | Self::True(source)
             | Self::False(source)
             | Self::Exclaim(source)
-            | Self::Dollar(source)
             | Self::LBracket(source)
             | Self::RBracket(source)
             | Self::LBrace(source)
@@ -310,7 +301,6 @@ impl Token {
             | Self::KeyModule(source)
             | Self::KeyUse(source)
             | Self::KeyAs(source)
-            | Self::KeySchema(source)
             | Self::Int((source, ..))
             | Self::Float((source, ..))
             | Self::LegacyMacro(source)
@@ -323,7 +313,6 @@ impl Token {
             | Self::FTripleString((source, ..))
             | Self::UnterminatedString(source)
             | Self::Identifier((source, ..))
-            | Self::ControlIdentifier((source, ..))
             | Self::Version((source, ..))
             | Self::Require((source, ..))
             | Self::LineComment((source, ..))
@@ -346,7 +335,6 @@ impl Token {
             (Self::True(_), Self::True(_)) => true,
             (Self::False(_), Self::False(_)) => true,
             (Self::Exclaim(_), Self::Exclaim(_)) => true,
-            (Self::Dollar(_), Self::Dollar(_)) => true,
             (Self::LBracket(_), Self::LBracket(_)) => true,
             (Self::RBracket(_), Self::RBracket(_)) => true,
             (Self::LBrace(_), Self::LBrace(_)) => true,
@@ -387,7 +375,6 @@ impl Token {
             (Self::KeyModule(_), Self::KeyModule(_)) => true,
             (Self::KeyUse(_), Self::KeyUse(_)) => true,
             (Self::KeyAs(_), Self::KeyAs(_)) => true,
-            (Self::KeySchema(_), Self::KeySchema(_)) => true,
             (Self::Int((_, int1)), Self::Int((_, int2))) => int1 == int2,
             (Self::Float((_, float1)), Self::Float((_, float2))) => float1 == float2,
             (Self::ByteString((_, bytes1)), Self::ByteString((_, bytes2))) => bytes1 == bytes2,
@@ -401,7 +388,6 @@ impl Token {
             (Self::LegacyMacro(_), Self::LegacyMacro(_)) => true,
             (Self::LabelIdentifier((_, id1)), Self::LabelIdentifier((_, id2))) => id1 == id2,
             (Self::SymbolIdentifier((_, id1)), Self::SymbolIdentifier((_, id2))) => id1 == id2,
-            (Self::ControlIdentifier((_, id1)), Self::ControlIdentifier((_, id2))) => id1 == id2,
             (Self::Version((_, ver1)), Self::Version((_, ver2))) => ver1 == ver2,
             (Self::Require((_, req1)), Self::Require((_, req2))) => req1 == req2,
             (Self::LineComment((_, comment1)), Self::LineComment((_, comment2))) => {
@@ -860,7 +846,6 @@ mod test {
     #[test]
     fn test_punctuation_tokens() {
         assert_single_token("!", Token::Exclaim(Location::default()));
-        assert_single_token("$", Token::Dollar(Location::default()));
         assert_single_token("[", Token::LBracket(Location::default()));
         assert_single_token("]", Token::RBracket(Location::default()));
         assert_single_token("{", Token::LBrace(Location::default()));
@@ -1101,12 +1086,16 @@ mod test {
             panic!("Expected SymbolIdentifier token");
         }
 
-        // Test control identifier
+        // `$` control statements were removed; `$` must not lex as a token
         let mut lexer = Token::lexer("$control");
-        if let Token::ControlIdentifier((_, value)) = lexer.next().unwrap().unwrap() {
-            assert_eq!(value, "control");
+        assert!(lexer.next().unwrap().is_err());
+
+        // `schema` is an ordinary identifier now
+        let mut lexer = Token::lexer("schema");
+        if let Token::Identifier((_, value)) = lexer.next().unwrap().unwrap() {
+            assert_eq!(value, "schema");
         } else {
-            panic!("Expected ControlIdentifier token");
+            panic!("Expected Identifier token for 'schema'");
         }
     }
 

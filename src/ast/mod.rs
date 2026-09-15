@@ -125,7 +125,6 @@ mod tests {
             stmt.id,
             stmt.uid,
             match &stmt.type_ {
-                StatementType::Control(_) => "Control",
                 StatementType::Assignment(_) => "Assignment",
                 StatementType::Block { .. } => "Block",
                 StatementType::Module(_) => "Module",

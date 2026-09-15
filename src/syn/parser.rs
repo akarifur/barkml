@@ -229,7 +229,8 @@ impl<'source> Parser<'source> {
         Self {
             tokens: TokenReader {
                 module_name: name.to_string(),
-                lexer: lexer.peekable(),
+                lexer,
+                peeked: None,
                 location: Location {
                     module: Some(name.to_string()),
                     line: 0,
@@ -248,7 +249,8 @@ impl<'source> Parser<'source> {
         Self {
             tokens: TokenReader {
                 module_name: name.to_string(),
-                lexer: lexer.peekable(),
+                lexer,
+                peeked: None,
                 location: Location {
                     module: Some(name.to_string()),
                     line: 0,
@@ -822,49 +824,22 @@ impl<'source> Parser<'source> {
         })?;
 
         match &token {
-            Token::ControlIdentifier((location, id)) => {
-                // Handle control statements ($identifier)
-                let mut location = location.clone();
+            Token::Error(loc)
+                if loc
+                    .source_text
+                    .as_deref()
+                    .is_some_and(|t| t.starts_with('$')) =>
+            {
+                // `$` control statements were removed from the language
+                let mut location = loc.clone();
                 location.set_module(self.tokens.module_name.as_str());
-
-                // Check for type annotation
-                let type_ = if let Some(Token::Colon(_)) = self.tokens.peek()? {
-                    self.tokens.discard();
-                    Some(self.value_type()?)
-                } else {
-                    None
-                };
-
-                // Expect assignment operator
-                let eq = self.tokens.next()?.context(error::EofSnafu {
-                    location: location.clone(),
-                })?;
-
-                let eq_loc = eq.location(Some(self.tokens.module_name.clone()));
-                ensure!(
-                    matches!(eq, Token::Assign(_)),
-                    error::ExpectedSnafu {
-                        location: eq_loc.clone(),
-                        expected: "=",
-                        got: eq.clone(),
-                        context: format!("while parsing control statement '${}'", id)
-                    }
-                );
-
-                // Parse value and check type compatibility
-                let (value, vtype) = self.value()?;
-                if let Some(type_) = type_.as_ref() {
-                    ensure!(
-                        vtype.can_assign(type_),
-                        error::AssignSnafu {
-                            location: location.clone(),
-                            left: type_.clone(),
-                            right: vtype
-                        }
-                    );
+                error::ExpectedSnafu {
+                    location,
+                    expected: "an assignment, block, or module statement",
+                    got: token.clone(),
+                    context: "control statements ($name = value) were removed; use an ordinary assignment or block instead".to_string(),
                 }
-
-                Ok(Statement::new_control(id.as_str(), type_, value, meta)?)
+                .fail()
             }
 
             t @ (Token::Identifier(..)
@@ -1021,8 +996,7 @@ impl<'source> Parser<'source> {
                 expected: "statement",
                 got: value.clone(),
                 location: value.location(Some(self.tokens.module_name.clone())),
-                context: "Expected a statement (assignment, control statement, or block)"
-                    .to_string(),
+                context: "Expected a statement (assignment or block)".to_string(),
             }
             .fail(),
         }
@@ -1342,61 +1316,6 @@ mod test {
     #[test]
     fn statements() {
         for (case, expected) in [
-            (
-                "$foo = 3",
-                Statement::new_control(
-                    "foo",
-                    None,
-                    Value::new_int(3, Metadata::default()),
-                    Metadata::default(),
-                )
-                .unwrap(),
-            ),
-            (
-                "$foo: f64 = 3.14",
-                Statement::new_control(
-                    "foo",
-                    Some(ValueType::F64),
-                    Value::new_f64(3.14, Metadata::default()),
-                    Metadata::default(),
-                )
-                .unwrap(),
-            ),
-            (
-                "# Comment\n$foo: f64 = !Hint 3.14",
-                Statement::new_control(
-                    "foo",
-                    Some(ValueType::F64),
-                    Value::new_f64(
-                        3.14,
-                        Metadata {
-                            location: Location {
-                                module: None,
-                                line: 0,
-                                column: 0,
-                                file_path: None,
-                                length: 0,
-                                source_text: None,
-                            },
-                            comment: None,
-                            label: Some("Hint".to_string()),
-                        },
-                    ),
-                    Metadata {
-                        location: Location {
-                            module: None,
-                            line: 0,
-                            column: 0,
-                            file_path: None,
-                            length: 0,
-                            source_text: None,
-                        },
-                        comment: Some("Comment".to_string()),
-                        label: None,
-                    },
-                )
-                .unwrap(),
-            ),
             (
                 "foo = 3",
                 Statement::new_assign(

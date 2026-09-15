@@ -270,24 +270,6 @@ impl Statement {
         })
     }
 
-    /// Creates a new control statement
-    pub fn new_control(
-        id: &str,
-        type_hint: Option<ValueType>,
-        value: Value,
-        meta: Metadata,
-    ) -> Result<Self> {
-        let expected_type = type_hint.unwrap_or_else(|| value.type_of());
-        let converted_value = Self::convert_value(&expected_type, &value)?;
-
-        Ok(Self::new(
-            id,
-            StatementType::Control(expected_type),
-            StatementData::Single(converted_value),
-            meta,
-        ))
-    }
-
     /// Creates a new assignment statement
     pub fn new_assign(
         id: &str,
@@ -425,7 +407,7 @@ impl Statement {
     pub fn validate(&self) -> Result<()> {
         // Validate this statement
         match &self.type_ {
-            StatementType::Control(expected) | StatementType::Assignment(expected) => {
+            StatementType::Assignment(expected) => {
                 if let Some(value) = self.get_value() {
                     if !expected.can_assign(&value.type_of()) {
                         return error::ImplicitConvertSnafu {
@@ -456,9 +438,6 @@ impl fmt::Display for Statement {
         }
 
         match &self.type_ {
-            StatementType::Control(type_) => {
-                write!(f, "${}: {} = {}", self.id, type_, self.get_value().unwrap())
-            }
             StatementType::Assignment(type_) => {
                 write!(f, "{}: {} = {}", self.id, type_, self.get_value().unwrap())
             }

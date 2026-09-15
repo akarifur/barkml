@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **Breaking:** `$` control statements (`$name = value`) and the unused BMLS schema
+  surface. `$`-prefixed statements now fail with a parse error pointing at ordinary
+  assignments/blocks as the replacement; `$` remains literal inside strings.
+  - Removed `Statement::new_control`, `StatementType::Control`, and the
+    `Token::ControlIdentifier`/`Token::Dollar`/`Token::KeySchema` tokens.
+  - `schema` is now an ordinary identifier (usable as an assignment name, block name,
+    table key, and reference-path component).
+  - Removed `examples/example.bmls`; there is no built-in schema language. Schemas are
+    data interpreted by the consuming application.
+  - `TokenReader` now holds a raw `logos::Lexer` plus an internal peek buffer instead of
+    a `Peekable` wrapper (construct via `Parser::new`/`Parser::with_file_path`).
+  - Migration: replace `$tire = !Test 1.0.0` with `tire = !Test 1.0.0`, or group metadata
+    into application-defined blocks such as `stead { schema = 1.0.0 }`.
+
 ## [0.9.0] - 2026-09-15
 
 ### Features
