@@ -230,7 +230,7 @@ pub enum Token {
     )]
     Require((Location, semver::VersionReq)),
 
-    #[regex(r"(#[ \t\f]*[^\n\r]+[\n\r])*", line_comment)]
+    #[regex(r"(#[ \t\f]*[^\n\r]+[\n\r])+", line_comment)]
     LineComment((Location, String)),
     #[regex(r"\/\*[^\/\*]*\*\/", multiline_comment)]
     MultiLineComment((Location, String)),

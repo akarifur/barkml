@@ -14,14 +14,14 @@ full = []
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [dependencies]
-base64 = "0.22"
-indexmap = { version = "2.9", features = ["serde"] }
-logos = "0.15"
+base64 = "0.23"
+indexmap = { version = "2.14", features = ["serde"] }
+logos = "0.16"
 semver = { version = "1.0", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
-snafu = "0.8"
-uuid = { version = "1.16", features = ["serde", "v7"] }
+snafu = "0.9"
+uuid = { version = "1", features = ["serde", "v7"] }
 
 [dev-dependencies]
 assert_matches = "1.5"
