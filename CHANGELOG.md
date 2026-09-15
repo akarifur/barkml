@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
+ - **Blocks: string-only labels with structured identity.** Block labels must now be literal
+   strings. Numbers, booleans, null, arrays, tables, bytes, versions, symbols, and macro
+   references are rejected as labels with a location-aware error (they remain valid as
+   *values*). Comma separators between labels are no longer accepted; labels are
+   space-separated. Quoted strings now support backslash escapes (`\"`, `\'`, `\\`, `\n`,
+   `\r`, `\t`), so labels (and string values) can contain escaped quotes.
+
+   Block identity is the block id plus the **ordered sequence of labels**, preserved as
+   structured components everywhere — never dot-joined. `app "a.b"` and `app "a" "b"` are
+   distinct identities and no longer collide in child storage, macro resolution, or lookup.
+
+   API migration:
+
+   - `Statement::inject_id()` is removed. Child map keys are storage slots only:
+     the statement id for zero-label statements, the statement uid for labeled blocks.
+     Use `Statement::identity()` for `(id, labels)`, `Statement::get_child(id, &labels)`
+     for structured lookup, and `Statement::blocks()` for an AST-aware traversal yielding
+     each block's identity (the Serde child-map projection does not expose labels).
+   - `Walk::get_blocks(id)` now returns `Vec<Vec<String>>` (each block's ordered label
+     sequence) instead of dot-joined map keys. Use `Walk::walk_block(id, &labels)` to
+     navigate to a labeled block.
+   - `Scope::symbol_table()` is now keyed by `Vec<Segment>` (`Segment::Id` / `Segment::Label`)
+     and `Scope::path_lookup()` maps to `Vec<Segment>`; use `Scope::lookup_segments` for
+     exact structured lookup. `Scope::lookup("a.b.c")` still accepts dotted strings, where
+     each component matches an id or a label in order; labels containing dots require the
+     segment-based API (dotted surface syntax for them is deferred to a later release).
+   - `Scope::available_paths()` returns owned dotted display strings; two distinct
+     structured paths may render identically, so treat these as diagnostics only.
+
  - **Removed:** TOML-style section headers (`[name]` / `["name"]`). Blocks are now the only
    structural grouping construct. Migrate by replacing each section header with a block:
 

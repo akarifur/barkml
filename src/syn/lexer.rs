@@ -196,8 +196,8 @@ pub enum Token {
     MacroString((Location, String)),
     #[regex(r"b'[-A-Za-z0-9+/]*={0,3}'", byte_string)]
     ByteString((Location, Vec<u8>)),
-    #[regex(r"'[^']*'", quote_string)]
-    #[regex(r#""[^"]*""#, quote_string)]
+    #[regex(r"'([^'\\]|\\.)*'", quote_string)]
+    #[regex(r#""([^"\\]|\\.)*""#, quote_string)]
     String((Location, String)),
 
     #[regex(r"[a-zA-Z][a-zA-Z0-9_\-]*", |x| {
@@ -463,12 +463,34 @@ fn version_literal(lexer: &mut Lexer<Token>) -> Result<(Location, semver::Versio
 
 fn quote_string(lexer: &mut Lexer<Token>) -> (Location, String) {
     let slice = lexer.slice();
-    let value = slice
-        .trim_start_matches('"')
-        .trim_start_matches('\'')
-        .trim_end_matches('\'')
-        .trim_end_matches('"');
-    (base_callback(lexer), value.to_string())
+    let inner = if let Some(stripped) = slice.strip_prefix('"') {
+        stripped.strip_suffix('"').unwrap_or(stripped)
+    } else if let Some(stripped) = slice.strip_prefix('\'') {
+        stripped.strip_suffix('\'').unwrap_or(stripped)
+    } else {
+        slice
+    };
+    (base_callback(lexer), unescape(inner))
+}
+
+/// Resolves backslash escape sequences in string literals
+fn unescape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some(escaped) => out.push(escaped),
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 fn byte_string(lexer: &mut Lexer<Token>) -> Result<(Location, Vec<u8>)> {

@@ -1,6 +1,6 @@
 use super::lexer::{HashableFloat, Integer, Token};
 use super::read::{Read, TokenReader};
-use crate::ast::{Location, Metadata, Statement, Value, ValueType};
+use crate::ast::{Data, Location, Metadata, Statement, Value, ValueType};
 use crate::{Result, error};
 use indexmap::IndexMap;
 use logos::Lexer;
@@ -579,21 +579,36 @@ impl<'source> Parser<'source> {
                         }
 
                         _ => {
-                            // This is a block
+                            // This is a block; parse zero or more literal
+                            // string labels until the opening brace
                             let mut labels = Vec::with_capacity(4);
 
-                            // Parse labels until we hit the opening brace
                             loop {
                                 match self.tokens.peek()? {
                                     Some(Token::LBrace(_)) => {
                                         self.tokens.discard();
                                         break;
                                     }
-                                    Some(Token::Comma(_)) => {
+                                    Some(Token::String((loc, label))) => {
+                                        let value = Value::new(
+                                            Data::String(label),
+                                            Metadata::new(loc.clone()),
+                                        );
+                                        labels.push(value);
                                         self.tokens.discard();
                                     }
-                                    Some(_) => {
-                                        labels.push(self.value()?.0);
+                                    Some(other) => {
+                                        return error::ExpectedSnafu {
+                                            location: other
+                                                .location(Some(self.tokens.module_name.clone())),
+                                            expected: "literal string block label or '{'",
+                                            got: other.clone(),
+                                            context: format!(
+                                                "block labels must be literal strings; while parsing block '{}'",
+                                                id
+                                            ),
+                                        }
+                                        .fail();
                                     }
                                     None => {
                                         return error::ExpectedSnafu {
@@ -620,7 +635,7 @@ impl<'source> Parser<'source> {
                                     }
                                     _ => {
                                         let value = self.statement()?;
-                                        children.insert(value.inject_id(), value);
+                                        children.insert(value.storage_key(), value);
                                     }
                                 }
                             }
@@ -683,7 +698,7 @@ impl<'source> Parser<'source> {
                 }
                 _ => {
                     let value = self.statement()?;
-                    children.insert(value.inject_id(), value);
+                    children.insert(value.storage_key(), value);
                 }
             }
         }
@@ -1130,7 +1145,7 @@ mod test {
         assert!(children["empty"].child_count() == 0);
 
         let outer = &children["outer"];
-        let inner = &outer.get_labeled().unwrap().1["inner.labeled"];
+        let inner = outer.get_child("inner", &["labeled"]).unwrap();
         assert_eq!(inner.get_labeled().unwrap().0.len(), 1);
 
         // Statement after a closing brace belongs to the parent (module) scope
@@ -1171,5 +1186,140 @@ mod test {
             children["tbl"].type_,
             StatementType::Assignment(_)
         ));
+    }
+
+    #[test]
+    fn block_labels_string_only() {
+        let input = concat!(
+            "settings {\n",
+            "  editor = 'nvim'\n",
+            "}\n",
+            "app \"firefox\" {\n",
+            "  enabled = true\n",
+            "}\n",
+            "artifact \"linux\" \"aarch64\" {\n",
+            "  url = 'https://example.invalid/tool'\n",
+            "}\n"
+        );
+
+        let mut parser = parser!(input);
+        let module = parser.module().unwrap();
+        let children = module.get_grouped().unwrap();
+        assert_eq!(children.len(), 3);
+
+        let (labels, _) = children["settings"].get_labeled().unwrap();
+        assert_eq!(labels.len(), 0);
+
+        let app = module.get_child("app", &["firefox"]).unwrap();
+        assert_eq!(app.get_labeled().unwrap().0.len(), 1);
+
+        let artifact = module.get_child("artifact", &["linux", "aarch64"]).unwrap();
+        let (labels, _) = artifact.get_labeled().unwrap();
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[0].as_string(), Some(&"linux".to_string()));
+        assert_eq!(labels[1].as_string(), Some(&"aarch64".to_string()));
+        // Order matters: reversed sequence must not match
+        assert!(
+            module
+                .get_child("artifact", &["aarch64", "linux"])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn non_string_labels_rejected() {
+        for input in [
+            "app 1 {\n}\n",
+            "app -3 {\n}\n",
+            "app 3.14 {\n}\n",
+            "app true {\n}\n",
+            "app false {\n}\n",
+            "app null {\n}\n",
+            "app 1.2.3 {\n}\n",
+            "app ^1.2.3 {\n}\n",
+            "app b'Yg==' {\n}\n",
+            "app foo {\n}\n",
+            "app :symbol {\n}\n",
+            "app 'a', 'b' {\n}\n",
+            "app [1, 2] {\n}\n",
+            "app { foo = 1 } {\n}\n",
+        ] {
+            let mut parser = parser!(input);
+            let err = parser
+                .module()
+                .err()
+                .unwrap_or_else(|| panic!("expected error for: {input}"));
+            assert!(
+                err.to_string().contains("literal string block label")
+                    || err.to_string().contains("Expected a statement"),
+                "for input {input:?} got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn label_special_characters_survive() {
+        let input = concat!(
+            "app \"a.b\" {\n  enabled = true\n}\n",
+            "app \"a\" \"b\" {\n  enabled = false\n}\n",
+            "weird \"hello world\" \"[brackets]\" \"日本語\" \"say \\\"hi\\\"\" {\n}\n"
+        );
+
+        let mut parser = parser!(input);
+        let module = parser.module().unwrap();
+        let children = module.get_grouped().unwrap();
+
+        // Structured identity keeps "a.b" distinct from "a" "b"
+        assert_eq!(children.len(), 3);
+        let dotted = module.get_child("app", &["a.b"]).unwrap();
+        let value = dotted.get_labeled().unwrap().1["enabled"]
+            .get_value()
+            .unwrap();
+        assert_eq!(value.as_bool(), Some(&true));
+        let split = module.get_child("app", &["a", "b"]).unwrap();
+        let value = split.get_labeled().unwrap().1["enabled"]
+            .get_value()
+            .unwrap();
+        assert_eq!(value.as_bool(), Some(&false));
+
+        // Dots, spaces, brackets, Unicode, and escaped quotes all survive
+        let weird = module
+            .get_child(
+                "weird",
+                &["hello world", "[brackets]", "日本語", "say \"hi\""],
+            )
+            .unwrap();
+        assert_eq!(weird.get_labeled().unwrap().0.len(), 4);
+    }
+
+    #[test]
+    fn labeled_blocks_via_ast_traversal() {
+        let input = concat!(
+            "app \"a.b\" {\n  enabled = true\n}\n",
+            "app \"a\" \"b\" {\n  enabled = false\n}\n"
+        );
+
+        let mut parser = parser!(input);
+        let module = parser.module().unwrap();
+
+        let identities: Vec<(String, Vec<String>)> = module
+            .blocks()
+            .map(|(id, labels, _)| {
+                (
+                    id.to_string(),
+                    labels
+                        .iter()
+                        .map(|l| l.as_string().cloned().unwrap())
+                        .collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            identities,
+            vec![
+                ("app".to_string(), vec!["a.b".to_string()]),
+                ("app".to_string(), vec!["a".to_string(), "b".to_string()]),
+            ]
+        );
     }
 }

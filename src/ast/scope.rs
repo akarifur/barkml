@@ -3,10 +3,42 @@ use super::{Data, Statement, StatementData, Value};
 use crate::{Result, error};
 use indexmap::{IndexMap, IndexSet};
 use snafu::{OptionExt, ensure};
+use std::fmt;
 use uuid::Uuid;
 
 /// Maximum recursion depth for macro resolution to prevent infinite loops
 const MAX_RECURSION_DEPTH: usize = 100;
+
+/// A single component of a structured symbol-table path.
+///
+/// Path components keep block-identity boundaries intact: a block named
+/// `app` labeled `"a.b"` contributes `[Id("app"), Label("a.b")]`, which
+/// is distinct from `app "a" "b"` (`[Id("app"), Label("a"), Label("b")]`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Segment {
+    /// A statement identifier component
+    Id(String),
+    /// A block label component
+    Label(String),
+}
+
+impl Segment {
+    /// Returns true if this segment is addressable by the given string
+    /// on the dotted macro-reference surface syntax.
+    pub fn matches(&self, input: &str) -> bool {
+        match self {
+            Self::Id(value) | Self::Label(value) => value == input,
+        }
+    }
+}
+
+impl fmt::Display for Segment {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Id(value) | Self::Label(value) => write!(f, "{}", value),
+        }
+    }
+}
 
 /// Scope is used to resolve macros and manage symbol references
 ///
@@ -21,11 +53,11 @@ pub struct Scope {
     /// The root statement (typically a module) that defines the scope
     root: Statement,
 
-    /// Maps fully-qualified paths to their corresponding values
-    symbol_table: IndexMap<String, Value>,
+    /// Maps structured paths to their corresponding values
+    symbol_table: IndexMap<Vec<Segment>, Value>,
 
-    /// Maps value UIDs to their fully-qualified paths for efficient lookup
-    path_lookup: IndexMap<Uuid, String>,
+    /// Maps value UIDs to their structured paths for efficient lookup
+    path_lookup: IndexMap<Uuid, Vec<Segment>>,
 
     /// Current recursion depth for macro resolution
     recursion_depth: usize,
@@ -45,9 +77,19 @@ impl Scope {
     }
 
     /// Builds the symbol table by walking the AST
-    fn build_symbol_table(scope: &mut Scope, node: &Statement, path: Vec<String>) {
+    fn build_symbol_table(scope: &mut Scope, node: &Statement, path: Vec<Segment>) {
         let mut new_path = path;
-        new_path.push(node.id.clone());
+        new_path.push(Segment::Id(node.id.clone()));
+
+        // A block's labels are ordered path components in their own right,
+        // preserving component boundaries instead of dot-joining.
+        if let StatementData::Labeled(labels, _) = &node.data {
+            for label in labels {
+                if let Some(text) = label.as_string() {
+                    new_path.push(Segment::Label(text.clone()));
+                }
+            }
+        }
 
         match &node.data {
             StatementData::Group(children) | StatementData::Labeled(_, children) => {
@@ -62,21 +104,21 @@ impl Scope {
     }
 
     /// Recursively walks through a value to build symbol table entries
-    fn walk_value(scope: &mut Scope, node: &Value, path: Vec<String>) {
+    fn walk_value(scope: &mut Scope, node: &Value, path: Vec<Segment>) {
         Self::add_symbol(scope, path.clone(), node);
 
         match &node.data {
             Data::Table(contents) => {
                 for (key, value) in contents {
                     let mut new_path = path.clone();
-                    new_path.push(key.clone());
+                    new_path.push(Segment::Id(key.clone()));
                     Self::walk_value(scope, value, new_path);
                 }
             }
             Data::Array(contents) => {
                 for (index, child) in contents.iter().enumerate() {
                     let mut array_path = path.clone();
-                    array_path.push(index.to_string());
+                    array_path.push(Segment::Id(index.to_string()));
                     Self::walk_value(scope, child, array_path);
                 }
             }
@@ -85,10 +127,26 @@ impl Scope {
     }
 
     /// Adds a symbol to the symbol table
-    fn add_symbol(scope: &mut Scope, path: Vec<String>, node: &Value) {
-        let key = path.join(".");
-        scope.symbol_table.insert(key.clone(), node.clone());
-        scope.path_lookup.insert(node.uid, key);
+    fn add_symbol(scope: &mut Scope, path: Vec<Segment>, node: &Value) {
+        scope.symbol_table.insert(path.clone(), node.clone());
+        scope.path_lookup.insert(node.uid, path);
+    }
+
+    /// Finds a symbol table entry addressable by the given dotted path
+    /// components. Both `Id` and `Label` segments match by their string
+    /// value, in path order, so ordered label sequences are addressed
+    /// unambiguously.
+    fn get_by_parts(&self, parts: &[String]) -> Option<&Value> {
+        self.symbol_table
+            .iter()
+            .find(|(path, _)| {
+                path.len() == parts.len()
+                    && path
+                        .iter()
+                        .zip(parts)
+                        .all(|(segment, part)| segment.matches(part))
+            })
+            .map(|(_, value)| value)
     }
 
     /// Applies macro resolution to the entire scope
@@ -100,7 +158,7 @@ impl Scope {
     }
 
     /// Resolves a path reference, handling relative paths like 'self' and 'super'
-    fn resolve_path(&self, current: &Value, input: String) -> Result<String> {
+    fn resolve_path(&self, current: &Value, input: String) -> Result<Vec<String>> {
         let operating_path: Vec<String> = if input.starts_with("self") || input.starts_with("super")
         {
             let current_path = self
@@ -110,9 +168,13 @@ impl Scope {
                     location: current.meta.location.clone(),
                     path: "unknown".to_string(),
                 })?;
+            let current_path: Vec<String> = current_path
+                .iter()
+                .map(|segment| segment.to_string())
+                .collect();
 
             if input.starts_with("super") {
-                let mut current_segments: Vec<&str> = current_path.split('.').collect();
+                let mut current_segments = current_path;
                 let new_segments: Vec<&str> = input.split('.').collect();
 
                 // Remove the current segment for 'super'
@@ -123,14 +185,14 @@ impl Scope {
                     if *segment == "super" {
                         current_segments.pop();
                     } else {
-                        current_segments.push(segment);
+                        current_segments.push(segment.to_string());
                     }
                 }
 
-                current_segments.iter().map(|x| x.to_string()).collect()
+                current_segments
             } else {
                 // Replace 'self' with current path
-                let replaced = input.replace("self", current_path);
+                let replaced = input.replace("self", &current_path.join("."));
                 replaced.split('.').map(|x| x.to_string()).collect()
             }
         } else {
@@ -151,7 +213,7 @@ impl Scope {
             }
         }
 
-        Ok(final_path.join("."))
+        Ok(final_path)
     }
     /// Resolves a macro reference to its actual value
     fn resolve_macro(
@@ -184,7 +246,7 @@ impl Scope {
         // First check if the whole string is a singular reference to a macro value
         let path = self.resolve_path(at, input.clone())?;
 
-        if let Some(data) = self.symbol_table.get(&path) {
+        if let Some(data) = self.get_by_parts(&path) {
             let mut resolved_value = Value {
                 uid: at.uid,
                 data: data.data.clone(),
@@ -237,11 +299,10 @@ impl Scope {
                 '}' if brace_depth == 1 => {
                     // Resolve the macro reference
                     let path = self.resolve_path(at, current_macro.clone())?;
-                    let resolved_value =
-                        self.symbol_table.get(&path).context(error::NoMacroSnafu {
-                            location: at.meta.location.clone(),
-                            path: current_macro.clone(),
-                        })?;
+                    let resolved_value = self.get_by_parts(&path).context(error::NoMacroSnafu {
+                        location: at.meta.location.clone(),
+                        path: current_macro.clone(),
+                    })?;
 
                     let mut final_value = resolved_value.clone();
                     if matches!(final_value.data, Data::Macro(_)) {
@@ -404,23 +465,40 @@ impl Scope {
     }
 
     /// Returns a reference to the symbol table
-    pub fn symbol_table(&self) -> &IndexMap<String, Value> {
+    pub fn symbol_table(&self) -> &IndexMap<Vec<Segment>, Value> {
         &self.symbol_table
     }
 
     /// Returns a reference to the path lookup table
-    pub fn path_lookup(&self) -> &IndexMap<Uuid, String> {
+    pub fn path_lookup(&self) -> &IndexMap<Uuid, Vec<Segment>> {
         &self.path_lookup
     }
 
-    /// Looks up a value by path
+    /// Looks up a value by its dotted path. Both statement identifiers and
+    /// block labels match by string, in order.
     pub fn lookup(&self, path: &str) -> Option<&Value> {
+        let parts: Vec<String> = path.split('.').map(|x| x.to_string()).collect();
+        self.get_by_parts(&parts)
+    }
+
+    /// Looks up a value by structured path segments
+    pub fn lookup_segments(&self, path: &[Segment]) -> Option<&Value> {
         self.symbol_table.get(path)
     }
 
-    /// Returns all available paths in the symbol table
-    pub fn available_paths(&self) -> Vec<&String> {
-        self.symbol_table.keys().collect()
+    /// Returns all available paths in the symbol table as dotted display
+    /// strings. Note that dotted display is for diagnostics only; two
+    /// distinct structured paths may render identically.
+    pub fn available_paths(&self) -> Vec<String> {
+        self.symbol_table
+            .keys()
+            .map(|path| {
+                path.iter()
+                    .map(|segment| segment.to_string())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
+            .collect()
     }
 
     /// Validates that all macro references can be resolved
@@ -428,7 +506,7 @@ impl Scope {
         for (_path, value) in &self.symbol_table {
             if let Data::Macro(macro_ref) = &value.data {
                 let resolved_path = self.resolve_path(value, macro_ref.clone())?;
-                if !self.symbol_table.contains_key(&resolved_path) {
+                if self.get_by_parts(&resolved_path).is_none() {
                     return error::NoMacroSnafu {
                         location: value.meta.location.clone(),
                         path: macro_ref.clone(),
@@ -488,5 +566,64 @@ mod tests {
         if let Some(resolved_value) = resolved_macro.get_value() {
             assert_eq!(resolved_value.as_string(), Some(&"hello".to_string()));
         }
+    }
+    #[test]
+    fn test_labeled_block_identity_distinct() {
+        let meta = Metadata::new(Location::new(0, 0));
+        let mut children = IndexMap::new();
+
+        let label = |text: &str| Value::new_string(text.to_string(), meta.clone());
+        let make_block = |id: &str, labels: Vec<Value>, enabled: bool| {
+            let mut inner = IndexMap::new();
+            let value = Value::new_bool(enabled, meta.clone());
+            inner.insert(
+                "enabled".to_string(),
+                Statement::new_assign("enabled", None, value, meta.clone()).unwrap(),
+            );
+            Statement::new_block(id, labels, inner, meta.clone())
+        };
+
+        // app "a.b" and app "a" "b" are distinct identities
+        children.insert(
+            "one".to_string(),
+            make_block("app", vec![label("a.b")], true),
+        );
+        children.insert(
+            "two".to_string(),
+            make_block("app", vec![label("a"), label("b")], false),
+        );
+
+        let module = Statement::new_module("root", children, meta);
+        let scope = Scope::new(&module);
+
+        // Structured paths are distinct keys
+        let dotted = scope
+            .symbol_table()
+            .get(&vec![
+                Segment::Id("root".into()),
+                Segment::Id("app".into()),
+                Segment::Label("a.b".into()),
+                Segment::Id("enabled".into()),
+            ])
+            .unwrap();
+        assert_eq!(dotted.as_bool(), Some(&true));
+
+        let split = scope
+            .symbol_table()
+            .get(&vec![
+                Segment::Id("root".into()),
+                Segment::Id("app".into()),
+                Segment::Label("a".into()),
+                Segment::Label("b".into()),
+                Segment::Id("enabled".into()),
+            ])
+            .unwrap();
+        assert_eq!(split.as_bool(), Some(&false));
+
+        // Dotted surface lookup matches label components in order
+        assert_eq!(
+            scope.lookup("root.app.a.b.enabled").unwrap().as_bool(),
+            Some(&false)
+        );
     }
 }

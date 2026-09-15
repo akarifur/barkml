@@ -50,17 +50,35 @@ Any back to back lines with # will be concatenated into a multiline comment.
 
 ### Blocks
 
-BarkML supports grouping and labeling a set of statements as blocks. These blocks can have 0 or more labels associated
-with them of any value type. If you wish to fetch or refer to a block in a macro or from the walker class the scope id will always be
-the id + labels all joined with '.'
+BarkML supports grouping and labeling a set of statements as blocks. Blocks can have zero or more labels associated with them. Labels must be **literal strings**; numbers, booleans, null, arrays, tables, bytes, versions, and other value types are rejected as labels.
+
+Block identity is **structured**: the block id plus the ordered sequence of labels. Component boundaries are preserved everywhere (parsing, child storage, lookup, macro resolution, serialization, diagnostics) — identities are never flattened into dot-joined strings, so `app "a.b"` and `app "a" "b"` are distinct.
 
 **Syntax:**
 
 ```
-<id> [<label>] {
+<id> ["<label>" ...] {
   <child-statements...>
 }
 ```
+
+**Examples:**
+
+```
+settings {
+    editor = "nvim"
+}
+
+app "firefox" {
+    enabled = true
+}
+
+artifact "linux" "aarch64" {
+    url = "https://example.invalid/tool"
+}
+```
+
+**Lookup.** Use `Statement::get_child(id, &["label", ...])`, `Walk::walk_block(id, &["label", ...])`, or `Scope::lookup_segments` to address a block by its full ordered label sequence. `Walk::get_blocks(id)` returns each sibling's ordered label sequence. `Scope::lookup("a.b.c")` still accepts dotted paths for convenience: each dotted component matches a statement id *or* a label in order, so a label containing dots cannot be expressed in dotted syntax — use the segment-based APIs for those.
 
 ### Assignments
 

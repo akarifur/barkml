@@ -212,8 +212,11 @@ impl<'source> Walk<'source> {
         }
     }
 
-    /// Get all blocks with a specific ID
-    pub fn get_blocks(&self, field: &str) -> Result<IndexSet<String>> {
+    /// Get all blocks with a specific ID, returning each block's ordered
+    /// label sequence. Label order is preserved and component boundaries are
+    /// kept intact: `app "a.b"` yields `["a.b"]` and `app "a" "b"` yields
+    /// `["a", "b"]`.
+    pub fn get_blocks(&self, field: &str) -> Result<Vec<Vec<String>>> {
         match self {
             Self::Statement(stmt) => {
                 let children = stmt
@@ -225,14 +228,45 @@ impl<'source> Walk<'source> {
 
                 Ok(children
                     .iter()
-                    .filter_map(|(k, s)| {
-                        if s.get_labeled().is_some() && s.id == field {
-                            Some(k.clone())
-                        } else {
-                            None
+                    .filter_map(|(_, s)| {
+                        let (labels, _) = s.get_labeled()?;
+                        if s.id != field {
+                            return None;
                         }
+                        Some(
+                            labels
+                                .iter()
+                                .map(|label| label.as_string().cloned().unwrap_or_default())
+                                .collect(),
+                        )
                     })
                     .collect())
+            }
+            Self::Value(value) => error::NotScopeSnafu {
+                location: value.meta.location.clone(),
+            }
+            .fail(),
+        }
+    }
+
+    /// Navigate to a block by structured identity: its id plus the ordered
+    /// label sequence. This is the unambiguous way to address labeled
+    /// blocks; `walk(field)` only addresses unlabeled children.
+    pub fn walk_block(&self, id: &str, labels: &[&str]) -> Result<Self> {
+        match self {
+            Self::Statement(stmt) => {
+                let target = stmt.get_child(id, labels).context(error::NoFieldSnafu {
+                    location: stmt.meta.location.clone(),
+                    field: format!(
+                        "{}{}",
+                        id,
+                        labels
+                            .iter()
+                            .map(|l| format!(" {:?}", l))
+                            .collect::<String>()
+                    ),
+                })?;
+                Ok(Self::Statement(target))
             }
             Self::Value(value) => error::NotScopeSnafu {
                 location: value.meta.location.clone(),

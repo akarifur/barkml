@@ -8,6 +8,19 @@
 //! - `error`: Custom error types for deserialization failures
 //! - `statement`: Deserializer implementation for `Statement` types
 //! - `value`: Deserializer implementation for `Value` types
+//!
+//! # Block labels and the child-map projection
+//!
+//! `from_statement` projects blocks as maps of their children; block labels are **not**
+//! exposed as fields in the deserialized value, and this projection does not reconstruct
+//! resource identity. Zero-label blocks appear under their id; labeled blocks appear under
+//! their storage slot key (a uid string), so same-kind siblings with different labels do
+//! not overwrite each other but cannot be located by label through this projection alone.
+//! Consumers that need a block's `(id, ordered labels)` identity should traverse the AST
+//! directly via [`crate::Statement::blocks`] / [`crate::Statement::identity`], or use the
+//! structured lookups [`crate::Statement::get_child`] / [`crate::load::Walk::walk_block`].
+//! Derived serde on `Statement`/`StatementData` (the AST round-trip path) retains the
+//! `Labeled` data, including labels.
 
 // External crates
 use serde::de::Deserialize;

@@ -2,9 +2,25 @@ use super::types::{Metadata, StatementType, ValueType};
 use super::value::{Data, Value};
 use crate::{Result, error};
 use indexmap::IndexMap;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use uuid::Uuid;
+
+fn deserialize_labels<'de, D>(deserializer: D) -> std::result::Result<Vec<Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let labels = Vec::<Value>::deserialize(deserializer)?;
+    for label in &labels {
+        if !matches!(label.data, Data::String(_)) {
+            return Err(serde::de::Error::custom(format!(
+                "invalid block label: expected a string, found {}",
+                label.type_of()
+            )));
+        }
+    }
+    Ok(labels)
+}
 
 /// Contains the actual set of data for a statement
 ///
@@ -14,9 +30,12 @@ use uuid::Uuid;
 pub enum StatementData {
     /// Data for block statements, which have labels and child statements
     ///
-    /// The first parameter is a vector of label values.
+    /// The first parameter is a vector of literal string label values.
     /// The second parameter is a map of child statements indexed by their IDs.
-    Labeled(Vec<Value>, IndexMap<String, Statement>),
+    Labeled(
+        #[serde(deserialize_with = "deserialize_labels")] Vec<Value>,
+        IndexMap<String, Statement>,
+    ),
 
     /// Data for module statements, which contain child statements
     ///
@@ -347,27 +366,59 @@ impl Statement {
         }
     }
 
-    /// Generates the injection ID for this statement (used for macro resolution)
-    pub fn inject_id(&self) -> String {
+    /// Returns the semantic identity of this statement: its id plus, for
+    /// blocks, the ordered sequence of literal string labels.
+    ///
+    /// Component boundaries are preserved: `app "a.b"` and `app "a" "b"`
+    /// are distinct identities.
+    pub fn identity(&self) -> (&str, &[Value]) {
+        let labels = match &self.data {
+            StatementData::Labeled(labels, _) => labels.as_slice(),
+            _ => &[],
+        };
+        (self.id.as_str(), labels)
+    }
+
+    /// Returns the storage key used to slot this statement into its parent's
+    /// child map. This is a map key, not a semantic identity: zero-label
+    /// statements use their id; labeled blocks use their unique uid so that
+    /// same-kind siblings with different labels never overwrite each other.
+    pub fn storage_key(&self) -> String {
         match &self.data {
-            StatementData::Labeled(labels, ..) => {
-                if labels.is_empty() {
-                    self.id.clone()
-                } else {
-                    let label_parts: Vec<String> = labels
-                        .iter()
-                        .map(|x| {
-                            x.to_string()
-                                .trim_matches('\'')
-                                .trim_matches('"')
-                                .to_string()
-                        })
-                        .collect();
-                    format!("{}.{}", self.id, label_parts.join("."))
-                }
-            }
+            StatementData::Labeled(labels, _) if !labels.is_empty() => self.uid.to_string(),
             _ => self.id.clone(),
         }
+    }
+
+    /// Finds a child block by structured identity: the block id plus the
+    /// ordered label sequence. An empty label slice matches zero-label blocks
+    /// and non-block children with the given id.
+    pub fn get_child(&self, id: &str, labels: &[&str]) -> Option<&Statement> {
+        self.children().find(|child| {
+            let (child_id, child_labels) = child.identity();
+            child_id == id
+                && child_labels.len() == labels.len()
+                && child_labels.iter().zip(labels).all(|(value, expected)| {
+                    value.as_string().map(|s| s == expected).unwrap_or(false)
+                })
+        })
+    }
+
+    /// Iterates over the child blocks of this statement, yielding each
+    /// block's structured identity `(id, ordered labels, statement)`.
+    ///
+    /// This is the AST-aware traversal for consumers that need resource
+    /// names; the Serde child-map projection does not expose labels.
+    pub fn blocks(&self) -> impl Iterator<Item = (&str, &[Value], &Statement)> {
+        self.children()
+            .filter(|child| matches!(child.data, StatementData::Labeled(..)))
+            .map(|child| {
+                let labels = match &child.data {
+                    StatementData::Labeled(labels, _) => labels.as_slice(),
+                    _ => &[],
+                };
+                (child.id.as_str(), labels, child)
+            })
     }
 
     /// Validates the statement structure recursively
@@ -413,13 +464,20 @@ impl fmt::Display for Statement {
             }
             StatementType::Block { .. } => {
                 let (labels, body) = self.get_labeled().unwrap();
-                let labels_str = labels
-                    .iter()
-                    .map(|x| x.to_string())
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let labels_str = if labels.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " {}",
+                        labels
+                            .iter()
+                            .map(|x| x.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    )
+                };
 
-                writeln!(f, "{} {} {{", self.id, labels_str)?;
+                writeln!(f, "{}{} {{", self.id, labels_str)?;
                 for child in body.values() {
                     writeln!(f, "  {}", child)?;
                 }
@@ -516,5 +574,54 @@ mod tests {
             assert_eq!(converted_value.type_of(), ValueType::U64);
             assert_eq!(converted_value.as_u64(), Some(&42u64));
         }
+    }
+    #[test]
+    fn test_labeled_statement_serde_round_trip() {
+        use serde_json;
+
+        let meta = Metadata::new(Location::new(1, 2));
+        let label = Value::new_string("a.b".to_string(), meta.clone());
+        let mut inner = IndexMap::new();
+        inner.insert(
+            "enabled".to_string(),
+            Statement::new_assign(
+                "enabled",
+                None,
+                Value::new_bool(true, meta.clone()),
+                meta.clone(),
+            )
+            .unwrap(),
+        );
+        let block = Statement::new_block("app", vec![label], inner, meta);
+
+        // Derived AST serde preserves Labeled data, including labels
+        let json = serde_json::to_string(&block).unwrap();
+        let round: Statement = serde_json::from_str(&json).unwrap();
+
+        let (labels, children) = round.get_labeled().unwrap();
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].as_string(), Some(&"a.b".to_string()));
+        assert_eq!(
+            children["enabled"].get_value().unwrap().as_bool(),
+            Some(&true)
+        );
+    }
+    #[test]
+    fn test_non_string_labels_rejected_by_serde() {
+        use serde_json;
+
+        let label = Value::new_u32(3, Metadata::new(Location::new(0, 0)));
+        let block = Statement::new_block(
+            "app",
+            vec![label],
+            IndexMap::new(),
+            Metadata::new(Location::new(0, 0)),
+        );
+        let json = serde_json::to_string(&block).unwrap();
+        let err = serde_json::from_str::<Statement>(&json).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid block label"),
+            "got: {err}"
+        );
     }
 }

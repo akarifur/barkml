@@ -8,7 +8,7 @@ section-1 {
   strings = "foobar"
   arrays  = ["hello", 5, 3.14, 'single']
   object = { foo = b'YmluYXJ5c3RyaW5n', "bar" = 4 }
-  blocks 0.3 "label-a" {
+  blocks "0.3" "label-a" {
       simple = "me"
   }
 }
