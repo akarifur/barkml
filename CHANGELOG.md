@@ -9,11 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Features
 
+- [**breaking**] Add explicit f-string interpolation and coherent string model
+
+### Misc.
+
+- *(ci)* Fix changelog for releasing
+
+## [0.9.0] - 2026-09-15
+
+### Features
+
 - [**breaking**] Remove TOML-style section headers in favor of blocks
 - [**breaking**] Restrict block labels to strings with structured identity
 - [**breaking**] Replace macro replacements with root-relative reference expressions
 - [**breaking**] Replace macro replacements with root-relative reference expressions
-- [**breaking**] Add explicit f-string interpolation and coherent string model
 
 ### Misc.
 
@@ -77,7 +86,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0] - 2024-03-22
 
-[unreleased]: https://github.com/akarifur/barkml/compare/v0.8.5..HEAD
+[unreleased]: https://github.com/akarifur/barkml/compare/v0.9.0..HEAD
+[0.9.0]: https://github.com/akarifur/barkml/compare/v0.8.5..v0.9.0
 [0.8.5]: https://github.com/akarifur/barkml/compare/v0.8.4..v0.8.5
 [0.8.4]: https://github.com/akarifur/barkml/compare/v0.8.3..v0.8.4
 [0.8.3]: https://github.com/akarifur/barkml/compare/0.8.2..v0.8.3
