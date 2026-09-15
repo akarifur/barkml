@@ -557,8 +557,9 @@ mod tests {
                 ),
                 (
                     "section-1".into(),
-                    Statement::new_section(
+                    Statement::new_block(
                         "section-1",
+                        Vec::new(),
                         IndexMap::from([
                             (
                                 "number".into(),

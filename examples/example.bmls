@@ -1,5 +1,5 @@
 $schema = !Schema 1.0.0
-[Test]
+Test {
 # Major Version family
 major "1" {
     # Define the base schema here
@@ -24,4 +24,4 @@ major "1" {
             }
         }
     }
-}
+}}

@@ -186,32 +186,6 @@ impl<'source> Walk<'source> {
         }
     }
 
-    /// Get all section names in the current scope
-    pub fn get_sections(&self) -> Result<IndexSet<String>> {
-        match self {
-            Self::Statement(stmt) => {
-                let children = stmt.get_grouped().context(error::NotScopeSnafu {
-                    location: stmt.meta.location.clone(),
-                })?;
-
-                Ok(children
-                    .iter()
-                    .filter_map(|(k, s)| {
-                        if matches!(s.type_, crate::StatementType::Section(..)) {
-                            Some(k.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect())
-            }
-            Self::Value(value) => error::NotScopeSnafu {
-                location: value.meta.location.clone(),
-            }
-            .fail(),
-        }
-    }
-
     /// Get all block names in the current scope
     pub fn get_all_blocks(&self) -> Result<IndexSet<String>> {
         match self {
@@ -367,7 +341,6 @@ impl fmt::Display for NodeType {
                     crate::StatementType::Control(_) => "Control",
                     crate::StatementType::Assignment(_) => "Assignment",
                     crate::StatementType::Block { .. } => "Block",
-                    crate::StatementType::Section(_) => "Section",
                     crate::StatementType::Module(_) => "Module",
                 }
             ),

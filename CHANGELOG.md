@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.9.0 (2025-09-15)
+
+### Breaking Changes
+
+ - **Removed:** TOML-style section headers (`[name]` / `["name"]`). Blocks are now the only
+   structural grouping construct. Migrate by replacing each section header with a block:
+
+   ```text
+   # 0.8.x                      # 0.9.0
+   [settings]                   settings {
+   editor = "nvim"                  editor = "nvim"
+                                }
+   ```
+
+   Parsing a legacy section header now fails with a migration-oriented diagnostic
+   pointing to the `name { ... }` form. Array literals (`[1, 2]`), array type syntax
+   (`array[string, int]`), and table values (`= { ... }`) are unaffected.
+
+ - **Removed APIs:** `StatementType::Section`, `Statement::new_section`, and
+   `Scope::get_sections` no longer exist. Use blocks (`Statement::new_block`,
+   `StatementType::Block`, `Scope::get_all_blocks`) instead.
+
 ## 0.8.5 (2025-06-16)
 
 ### New Features

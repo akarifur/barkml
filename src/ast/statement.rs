@@ -18,7 +18,7 @@ pub enum StatementData {
     /// The second parameter is a map of child statements indexed by their IDs.
     Labeled(Vec<Value>, IndexMap<String, Statement>),
 
-    /// Data for section and module statements, which contain child statements
+    /// Data for module statements, which contain child statements
     ///
     /// The parameter is a map of child statements indexed by their IDs.
     Group(IndexMap<String, Statement>),
@@ -63,7 +63,7 @@ impl StatementData {
 /// Represents top-level statements and groupings in the BarkML language
 ///
 /// A Statement is a fundamental structural element in BarkML. It can represent
-/// assignments, control statements, blocks, sections, or modules. Each statement
+/// assignments, control statements, blocks, or modules. Each statement
 /// has a unique identifier, a type, metadata, and associated data.
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Statement {
@@ -310,18 +310,6 @@ impl Statement {
         )
     }
 
-    /// Creates a new section statement
-    pub fn new_section(id: &str, children: IndexMap<String, Statement>, meta: Metadata) -> Self {
-        let statement_type = StatementType::Section(
-            children
-                .iter()
-                .map(|(k, v)| (k.clone(), v.type_.clone()))
-                .collect(),
-        );
-
-        Self::new(id, statement_type, StatementData::Group(children), meta)
-    }
-
     /// Creates a new module statement
     pub fn new_module(id: &str, children: IndexMap<String, Statement>, meta: Metadata) -> Self {
         let statement_type = StatementType::Module(
@@ -437,14 +425,6 @@ impl fmt::Display for Statement {
                 }
                 write!(f, "}}")
             }
-            StatementType::Section(_) => {
-                let body = self.get_grouped().unwrap();
-                writeln!(f, "[{}]", self.id)?;
-                for child in body.values() {
-                    writeln!(f, "{}", child)?;
-                }
-                Ok(())
-            }
             StatementType::Module(_) => {
                 let body = self.get_grouped().unwrap();
                 for (i, child) in body.values().enumerate() {
@@ -496,11 +476,11 @@ mod tests {
         let child_stmt = Statement::new_assign("child", None, child_value, meta.clone()).unwrap();
         children.insert("child".to_string(), child_stmt);
 
-        let section = Statement::new_section("test_section", children, meta);
+        let block = Statement::new_block("test_block", Vec::new(), children, meta);
 
-        assert!(section.is_container());
-        assert_eq!(section.child_count(), 1);
-        assert!(section.find_child("child").is_some());
+        assert!(block.is_container());
+        assert_eq!(block.child_count(), 1);
+        assert!(block.find_child("child").is_some());
     }
 
     #[test]
@@ -514,7 +494,7 @@ mod tests {
             Statement::new_assign("grandchild", None, grandchild_value, meta.clone()).unwrap();
         grandchildren.insert("grandchild".to_string(), grandchild);
 
-        let child = Statement::new_section("child", grandchildren, meta.clone());
+        let child = Statement::new_block("child", Vec::new(), grandchildren, meta.clone());
         children.insert("child".to_string(), child);
 
         let root = Statement::new_module("root", children, meta);

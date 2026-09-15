@@ -19,9 +19,10 @@
 //!
 //! let config = r#"
 //! versioning = "1.0.0"
-//! [database]
+//! database {
 //! host = "localhost"
 //! port = 5432
+//! }
 //! "#;
 //!
 //! let statement = from_str(config).expect("Failed to parse BarkML");
@@ -77,9 +78,10 @@ pub(crate) type Result<T> = std::result::Result<T, Error>;
 ///
 /// let config = r#"
 /// versioning = "1.0.0"
-/// [database]
+/// database {
 /// host = "localhost"
 /// port = 5432
+/// }
 /// "#;
 ///
 /// let statement = from_str(config).expect("Failed to parse BarkML");

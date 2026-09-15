@@ -305,10 +305,6 @@ pub enum StatementType {
         contents: IndexMap<String, Self>,
     },
 
-    /// Section statement ([identifier] statements)
-    /// Stores the types of contained statements
-    Section(IndexMap<String, Self>),
-
     /// Module statement (top-level container)
     /// Stores the types of contained statements
     Module(IndexMap<String, Self>),
@@ -317,10 +313,7 @@ pub enum StatementType {
 impl StatementType {
     /// Returns true if this statement type can contain child statements
     pub const fn is_container(&self) -> bool {
-        matches!(
-            self,
-            Self::Block { .. } | Self::Section(_) | Self::Module(_)
-        )
+        matches!(self, Self::Block { .. } | Self::Module(_))
     }
 
     /// Returns true if this statement type represents a value assignment
@@ -339,9 +332,7 @@ impl StatementType {
     /// Gets the child statement types for container statements
     pub fn child_types(&self) -> Option<&IndexMap<String, Self>> {
         match self {
-            Self::Block { contents, .. } | Self::Section(contents) | Self::Module(contents) => {
-                Some(contents)
-            }
+            Self::Block { contents, .. } | Self::Module(contents) => Some(contents),
             _ => None,
         }
     }

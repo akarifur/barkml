@@ -306,14 +306,6 @@ impl Scope {
 
                 Statement::new_module(&at.id, new_children, at.meta.clone())
             }
-            StatementType::Section(_) => {
-                let mut new_children = IndexMap::new();
-                for (key, value) in at.get_grouped().unwrap() {
-                    new_children.insert(key.clone(), self.resolve_statement(value, visit_log)?);
-                }
-
-                Statement::new_section(&at.id, new_children, at.meta.clone())
-            }
             StatementType::Block { .. } => {
                 let mut new_children = IndexMap::new();
                 let mut new_labels = Vec::new();

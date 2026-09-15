@@ -128,7 +128,6 @@ mod tests {
                 StatementType::Control(_) => "Control",
                 StatementType::Assignment(_) => "Assignment",
                 StatementType::Block { .. } => "Block",
-                StatementType::Section(_) => "Section",
                 StatementType::Module(_) => "Module",
             }
         ));

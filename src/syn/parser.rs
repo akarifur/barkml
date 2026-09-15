@@ -665,59 +665,21 @@ impl<'source> Parser<'source> {
         let mut children = IndexMap::with_capacity(16); // Pre-allocate with reasonable capacity
 
         while let Some(token) = self.tokens.peek()? {
-            let meta = self.metadata()?;
+            let _ = self.metadata()?;
             match token {
-                Token::LBracket(location) => {
+                Token::LBracket(ref location) => {
                     let mut location = location.clone();
                     location.set_module(self.tokens.module_name.as_str());
-                    self.tokens.discard();
 
-                    // Get section identifier
-                    let id = self.tokens.next()?.context(error::EofSnafu {
-                        location: location.clone(),
-                    })?;
-
-                    let id = match id {
-                        Token::Identifier((_, id)) | Token::String((_, id)) => Ok(id),
-                        value => error::ExpectedSnafu {
-                            location: value.location(Some(self.tokens.module_name.clone())),
-                            expected: "identifier or string",
-                            got: value.clone(),
-                            context: "while parsing section name".to_string(),
-                        }
-                        .fail(),
-                    }?;
-
-                    // Ensure closing bracket
-                    let close = self.tokens.next()?.context(error::EofSnafu {
-                        location: self.tokens.location(),
-                    })?;
-
-                    let close_loc = close.location(Some(self.tokens.module_name.clone()));
-                    ensure!(
-                        matches!(close, Token::RBracket(_)),
-                        error::ExpectedSnafu {
-                            location: close_loc.clone(),
-                            expected: "]",
-                            got: close.clone(),
-                            context: format!("while parsing section declaration '[{}]'", id)
-                        }
-                    );
-
-                    // Parse section statements
-                    let mut statements = IndexMap::with_capacity(8);
-                    while let Some(stmt) = self.tokens.peek()? {
-                        match stmt {
-                            Token::LBracket(_) => break,
-                            _ => {
-                                let value = self.statement()?;
-                                statements.insert(value.inject_id(), value);
-                            }
-                        }
+                    return error::ExpectedSnafu {
+                        location,
+                        expected: "block or statement",
+                        got: token.clone(),
+                        context: "section headers like '[name]' were removed in 0.9.0; \
+                                  use a block instead: name { ... }"
+                            .to_string(),
                     }
-
-                    let child = Statement::new_section(id.as_str(), statements, meta);
-                    children.insert(child.inject_id(), child);
+                    .fail();
                 }
                 _ => {
                     let value = self.statement()?;
@@ -734,7 +696,7 @@ impl<'source> Parser<'source> {
 mod test {
     use super::Parser;
     use crate::ast::Metadata;
-    use crate::ast::{Location, Statement, Value, ValueType};
+    use crate::ast::{Location, Statement, StatementType, Value, ValueType};
     use crate::syn::lexer::Token;
     use indexmap::IndexMap;
     use logos::Logos;
@@ -1138,5 +1100,76 @@ mod test {
         for _ in 0..100 {
             deeply_nested.push('}');
         }
+    }
+
+    #[test]
+    fn blocks_only_grouping() {
+        // Empty, unlabeled, labeled, nested, and sibling blocks
+        let input = concat!(
+            "empty {}\n",
+            "outer {\n",
+            "  inner 'labeled' {\n",
+            "    value = 1\n",
+            "  }\n",
+            "}\n",
+            "sibling {\n",
+            "  value = 2\n",
+            "}\n",
+            "after = true\n"
+        );
+
+        let mut parser = parser!(input);
+        let module = parser.module().unwrap();
+        let children = module.get_grouped().unwrap();
+
+        assert_eq!(children.len(), 4);
+        assert!(matches!(
+            children["empty"].type_,
+            StatementType::Block { .. }
+        ));
+        assert!(children["empty"].child_count() == 0);
+
+        let outer = &children["outer"];
+        let inner = &outer.get_labeled().unwrap().1["inner.labeled"];
+        assert_eq!(inner.get_labeled().unwrap().0.len(), 1);
+
+        // Statement after a closing brace belongs to the parent (module) scope
+        assert!(matches!(
+            children["after"].type_,
+            StatementType::Assignment(_)
+        ));
+    }
+
+    #[test]
+    fn legacy_section_headers_rejected() {
+        for input in ["[section-a]\nfoo = \"bar\"\n", "[\"section-b\"]\nfoo = 1\n"] {
+            let mut parser = parser!(input);
+            let err = parser.module().unwrap_err().to_string();
+            assert!(
+                err.contains("section headers"),
+                "expected migration diagnostic, got: {err}"
+            );
+            assert!(err.contains("name { ... }"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn arrays_and_tables_still_parse() {
+        // Arrays, typed arrays, and tables (incl. table nested in array) remain valid
+        let input = concat!(
+            "items = [\"a\", 1, 3.14]\n",
+            "typed: array[string, int] = [\"a\", 1]\n",
+            "nested = [{ foo = 1 }, { bar = \"baz\" }]\n",
+            "tbl = { inner = { deep = true } }\n"
+        );
+
+        let mut parser = parser!(input);
+        let module = parser.module().unwrap();
+        let children = module.get_grouped().unwrap();
+        assert_eq!(children.len(), 4);
+        assert!(matches!(
+            children["tbl"].type_,
+            StatementType::Assignment(_)
+        ));
     }
 }

@@ -11,8 +11,8 @@ the language supports self-referential macro replacements.
 
 ### Control Statements
 
-Control statements are generally used for specifying metadata related to the file,
-section or blocks. They are assignment statements to any variable starting with $
+Control statements are generally used for specifying metadata related to the file or
+blocks. They are assignment statements to any variable starting with $
 
 **Syntax:**
 
@@ -29,34 +29,6 @@ $control_id = !MyProgram 1.0.0
 The above example could be a way to define what schema this barkml utilizes. Note schema
 checking is currently not implemented directly in BarkML, it is on the writer of a tool using
 BarkML to define and check for a schema.
-
-### Sections
-
-The top-most grouping of data in BarkML are sections. Sections look identical to
-sections in TOML. Unlike TOML though BarkML does not allow nested sections. Sections are
-meant to be global groupings in a configuration file.
-
-**Syntax:**
-
-```
-[<name>|"<name>"]
-<child-statements...>
-```
-
-**Example:**
-
-```
-[section-a]
-foo = "bar"
-
-["section-b"]
-foo = "baz"
-```
-
-_NOTE: If the use case of the configuration file is to be sent over network or streamed to a service for some reason,
-the use of sections should be avoided as if the data sent is cutoff it could still result in a valid BarkML file.
-Instead
-use blocks as defined below to group statements in this use case_
 
 ### Comments
 
@@ -299,11 +271,13 @@ top of the configuration file. Macro replacements are full replacements
 
 ```
 version = "1.0.0"
-[section]
-val = 5
-[section-b]
-parent-version = m!version
-other-val = m!section.val
+section {
+    val = 5
+}
+section-b {
+    parent-version = m!version
+    other-val = m!section.val
+}
 ```
 
 ## Macro Strings

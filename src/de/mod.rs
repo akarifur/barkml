@@ -25,7 +25,7 @@ pub use value::*;
 /// Deserialize a type `T` from a BarkML `Statement`.
 ///
 /// This is the main entry point for deserializing Rust data structures from BarkML statements.
-/// It supports deserializing from module, section, block, and assignment statements.
+/// It supports deserializing from module, block, and assignment statements.
 ///
 /// # Errors
 ///
@@ -147,10 +147,11 @@ mod tests {
         app_name = "MyApp"
         features = ["auth", "logging", "metrics"]
 
-        [database]
+        database {
         host = "localhost"
         port = 5432u16
         ssl = true
+        }
         "#;
 
         // Act

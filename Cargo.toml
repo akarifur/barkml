@@ -1,6 +1,6 @@
 [package]
 name = "barkml"
-version = "0.8.5"
+version = "0.9.0"
 description = "Declarative configuration language"
 repository = "https://github.com/serates/barkml"
 categories = ["config"]
