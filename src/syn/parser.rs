@@ -220,6 +220,9 @@ fn read_placeholder_identifier(
 
 pub struct Parser<'source> {
     tokens: TokenReader<'source>,
+    /// Comments consumed by an enclosing scope's lookahead that belong to
+    /// the next statement's metadata
+    pending_meta: Option<Metadata>,
     /// Current recursion depth for preventing stack overflow
     recursion_depth: usize,
 }
@@ -241,6 +244,7 @@ impl<'source> Parser<'source> {
                 },
             },
             recursion_depth: 0,
+            pending_meta: None,
         }
     }
 
@@ -261,6 +265,7 @@ impl<'source> Parser<'source> {
                 },
             },
             recursion_depth: 0,
+            pending_meta: None,
         }
     }
 
@@ -377,7 +382,16 @@ impl<'source> Parser<'source> {
                         context: "while parsing array type definition".to_string()
                     }
                 );
+                let open = match tok {
+                    Token::LBracket(loc) => {
+                        let mut open = loc.clone();
+                        open.set_module(self.tokens.module_name.as_str());
+                        open
+                    }
+                    _ => unreachable!("ensured to be an LBracket above"),
+                };
                 let mut children = Vec::new();
+                let mut closed = false;
                 while let Some(tok) = self.tokens.peek()? {
                     match tok {
                         Token::Comma(_) => {
@@ -386,12 +400,22 @@ impl<'source> Parser<'source> {
                         }
                         Token::RBracket(_) => {
                             self.tokens.discard();
+                            closed = true;
                             break;
                         }
                         _ => {
                             children.push(self.value_type()?);
                         }
                     }
+                }
+                if !closed {
+                    return error::UnterminatedSnafu {
+                        open,
+                        expected: "]",
+                        eof: self.tokens.eof_location(),
+                        context: "array type definition".to_string(),
+                    }
+                    .fail();
                 }
                 Ok(ValueType::Array(children))
             }
@@ -409,10 +433,19 @@ impl<'source> Parser<'source> {
                         context: "while parsing table type definition".to_string()
                     }
                 );
+                let open = match tok {
+                    Token::LBrace(loc) => {
+                        let mut open = loc.clone();
+                        open.set_module(self.tokens.module_name.as_str());
+                        open
+                    }
+                    _ => unreachable!("ensured to be an LBrace above"),
+                };
                 let mut children = IndexMap::new();
                 // Scope-local key -> key-token locations for duplicate
                 // diagnostics (mirrors the table value path).
                 let mut key_locations: IndexMap<String, Location> = IndexMap::new();
+                let mut closed = false;
                 while let Some(tok) = self.tokens.peek()? {
                     match tok {
                         Token::Comma(_) => {
@@ -421,6 +454,7 @@ impl<'source> Parser<'source> {
                         }
                         Token::RBrace(_) => {
                             self.tokens.discard();
+                            closed = true;
                             break;
                         }
                         _ => {
@@ -475,6 +509,15 @@ impl<'source> Parser<'source> {
                             children.insert(id, subtype);
                         }
                     }
+                }
+                if !closed {
+                    return error::UnterminatedSnafu {
+                        open,
+                        expected: "}",
+                        eof: self.tokens.eof_location(),
+                        context: "table type definition".to_string(),
+                    }
+                    .fail();
                 }
                 Ok(ValueType::Table(children))
             }
@@ -697,9 +740,12 @@ impl<'source> Parser<'source> {
                 Ok((Value::new_require(value.clone(), meta), ValueType::Require))
             }
             // Array parsing
-            Token::LBracket(_) => {
+            Token::LBracket(location) => {
+                let mut open = location.clone();
+                open.set_module(self.tokens.module_name.as_str());
                 let mut children = Vec::with_capacity(8);
                 let mut child_types = Vec::with_capacity(8);
+                let mut closed = false;
 
                 while let Some(token) = self.tokens.peek()? {
                     match token {
@@ -709,6 +755,7 @@ impl<'source> Parser<'source> {
                         }
                         Token::RBracket(_) => {
                             self.tokens.discard();
+                            closed = true;
                             break;
                         }
                         _ => {
@@ -718,6 +765,15 @@ impl<'source> Parser<'source> {
                         }
                     };
                 }
+                if !closed {
+                    return error::UnterminatedSnafu {
+                        open,
+                        expected: "]",
+                        eof: self.tokens.eof_location(),
+                        context: "array value".to_string(),
+                    }
+                    .fail();
+                }
 
                 Ok((
                     Value::new_array(children, meta),
@@ -725,12 +781,15 @@ impl<'source> Parser<'source> {
                 ))
             }
             Token::LBrace(location) => {
+                let mut open = location.clone();
+                open.set_module(self.tokens.module_name.as_str());
                 let mut children = IndexMap::new();
                 let mut child_types = IndexMap::new();
                 // Scope-local map of table key -> key token location, kept so
                 // duplicate diagnostics report the key position rather than
                 // the value position after `=`.
                 let mut key_locations: IndexMap<String, Location> = IndexMap::new();
+                let mut closed = false;
                 while let Some(token) = self.tokens.peek()? {
                     match token {
                         Token::Comma(_) => {
@@ -739,6 +798,7 @@ impl<'source> Parser<'source> {
                         }
                         Token::RBrace(_) => {
                             self.tokens.discard();
+                            closed = true;
                             break;
                         }
                         Token::Identifier(_)
@@ -825,6 +885,15 @@ impl<'source> Parser<'source> {
                         }
                     }
                 }
+                if !closed {
+                    return error::UnterminatedSnafu {
+                        open,
+                        expected: "}",
+                        eof: self.tokens.eof_location(),
+                        context: "table value".to_string(),
+                    }
+                    .fail();
+                }
                 Ok((
                     Value::new_table(children, meta),
                     ValueType::Table(child_types),
@@ -852,7 +921,10 @@ impl<'source> Parser<'source> {
     /// declaring token (the identifier or string that names it). Parents use
     /// that location for duplicate-declaration diagnostics.
     fn statement_impl(&mut self) -> Result<(Statement, Location)> {
-        let meta = self.metadata()?;
+        let meta = match self.pending_meta.take() {
+            Some(meta) => meta,
+            None => self.metadata()?,
+        };
 
         let token = self.tokens.next()?.context(error::EofSnafu {
             location: self.tokens.location(),
@@ -944,9 +1016,13 @@ impl<'source> Parser<'source> {
                             // string labels until the opening brace
                             let mut labels = Vec::with_capacity(4);
 
+                            let open: Location;
                             loop {
                                 match self.tokens.peek()? {
-                                    Some(Token::LBrace(_)) => {
+                                    Some(Token::LBrace(loc)) => {
+                                        let mut loc = loc.clone();
+                                        loc.set_module(self.tokens.module_name.as_str());
+                                        open = loc;
                                         self.tokens.discard();
                                         break;
                                     }
@@ -1001,22 +1077,61 @@ impl<'source> Parser<'source> {
                             // Parse block contents
                             let mut children = IndexMap::with_capacity(8);
                             let mut key_locations = IndexMap::with_capacity(8);
+                            let mut closed = false;
                             while let Some(stmt) = self.tokens.peek()? {
                                 match stmt {
                                     Token::RBrace(_) => {
                                         self.tokens.discard();
+                                        closed = true;
                                         break;
                                     }
+                                    Token::LineComment(_) | Token::MultiLineComment(_) => {
+                                        // Look ahead past comments: if only `}`
+                                        // or EOF follows they are trailing
+                                        // block comments with no statement to
+                                        // attach to; otherwise keep them for
+                                        // the next statement's metadata
+                                        let meta = self.metadata()?;
+                                        match self.tokens.peek()? {
+                                            Some(Token::RBrace(_)) | None => {}
+                                            Some(_) => self.pending_meta = Some(meta),
+                                        }
+                                    }
                                     _ => {
-                                        let (value, key_location) = self.statement()?;
-                                        Self::insert_child(
-                                            &mut children,
-                                            &mut key_locations,
-                                            value,
-                                            key_location,
-                                        )?;
+                                        match self.statement() {
+                                            Ok((value, key_location)) => {
+                                                Self::insert_child(
+                                                    &mut children,
+                                                    &mut key_locations,
+                                                    value,
+                                                    key_location,
+                                                )?;
+                                            }
+                                            // EOF while parsing a statement is
+                                            // this block's missing `}`: report
+                                            // the opener, not a bare EOF
+                                            Err(crate::Error::Eof { .. }) => {
+                                                return error::UnterminatedSnafu {
+                                                    open: open.clone(),
+                                                    expected: "}",
+                                                    eof: self.tokens.eof_location(),
+                                                    context: format!("block '{}'", id),
+                                                }
+                                                .fail();
+                                            }
+                                            Err(e) => return Err(e),
+                                        }
                                     }
                                 }
+                            }
+                            if !closed {
+                                return error::UnterminatedSnafu {
+                                    open,
+                                    expected: "}",
+                                    eof: self.tokens.eof_location(),
+                                    context: format!("block '{}'", id),
+                                }
+                                .fail();
                             }
 
                             Ok((
@@ -1061,8 +1176,14 @@ impl<'source> Parser<'source> {
         let mut children = IndexMap::with_capacity(16); // Pre-allocate with reasonable capacity
         let mut key_locations = IndexMap::with_capacity(16);
 
-        while let Some(token) = self.tokens.peek()? {
+        loop {
             let _ = self.metadata()?;
+            // Re-peek after metadata(): comments were consumed, so the
+            // stale peeked token must not be dispatched to statement()
+            let token = match self.tokens.peek()? {
+                Some(token) => token,
+                None => break,
+            };
             match token {
                 Token::LBracket(ref location) => {
                     let mut location = location.clone();
@@ -1930,5 +2051,186 @@ mod test {
         duplicate_error("x {\n}\nx = 1\n", "x");
         // a labeled block never collides with an assignment of the same name
         parser!("x = 1\nx \"a\" {\n}\n").parse().unwrap();
+    }
+
+    // docs/09: every open block, table, or array must meet its closing
+    // delimiter; EOF inside a delimited construct is an error, not a
+    // silent success.
+    fn assert_unterminated(input: &str) -> crate::error::Error {
+        let err = match parser!(input).parse() {
+            Ok(_) => panic!("expected an unterminated error for {input:?}"),
+            Err(e) => e,
+        };
+        match &err {
+            crate::error::Error::Unterminated { .. } => err,
+            other => panic!("expected Unterminated for {input:?}, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unterminated_blocks_rejected() {
+        for input in [
+            "node {",
+            "node { ",
+            "node {\n",
+            "node { count = 1",
+            "node { count = 1\n",
+            "node {\n# trailing comment\n",
+            "node {\n  a = 1\n  # trailing\n",
+        ] {
+            let err = assert_unterminated(input);
+            let crate::error::Error::Unterminated {
+                open,
+                expected,
+                eof,
+                context,
+            } = &err
+            else {
+                unreachable!()
+            };
+            assert_eq!(expected, "}", "for {input:?}");
+            assert!(context.contains("block 'node'"), "for {input:?}: {context}");
+            assert_eq!(open.module.as_deref(), Some("root"), "for {input:?}");
+            assert_eq!(open.line, 0, "for {input:?}");
+            assert_eq!(open.column, 5, "for {input:?}");
+            assert_eq!(eof.module.as_deref(), Some("root"), "for {input:?}");
+        }
+    }
+
+    #[test]
+    fn unterminated_block_eof_location() {
+        // exact EOF line/column for a multiline document with trailing
+        // comment: the line-comment token swallows its newline, so EOF sits
+        // on line 2, 13 bytes past the line start (byte offset 28 - 15)
+        let crate::error::Error::Unterminated { open, eof, .. } =
+            assert_unterminated("node {\n  a = 1\n  # trailing\n")
+        else {
+            unreachable!()
+        };
+        assert_eq!((open.line, open.column), (0, 5));
+        assert_eq!((eof.line, eof.column), (2, 13));
+
+        // non-ASCII text before EOF: byte-based offsets stay consistent
+        // (α is two bytes; the `{` is still column 5 and EOF opens line 1)
+        let crate::error::Error::Unterminated { open, eof, .. } =
+            assert_unterminated("node { s = \"α\"\n")
+        else {
+            unreachable!()
+        };
+        assert_eq!((open.line, open.column), (0, 5));
+        assert_eq!((eof.line, eof.column), (1, 0));
+    }
+
+    #[test]
+    fn nested_unterminated_reports_innermost_opener() {
+        // inner block never closed: report the inner opener (line 1, col 8)
+        let crate::error::Error::Unterminated { open, context, .. } =
+            assert_unterminated("outer {\n  inner {\n    count = 1\n")
+        else {
+            unreachable!()
+        };
+        assert_eq!((open.line, open.column), (1, 8));
+        assert!(context.contains("block 'inner'"), "{context}");
+
+        // inner closed, outer not: report the outer opener (line 0, col 6)
+        let crate::error::Error::Unterminated { open, context, .. } =
+            assert_unterminated("outer {\n  inner {\n    count = 1\n  }\n")
+        else {
+            unreachable!()
+        };
+        assert_eq!((open.line, open.column), (0, 6));
+        assert!(context.contains("block 'outer'"), "{context}");
+    }
+
+    #[test]
+    fn unterminated_values_and_types() {
+        for (input, expected_delim, context_part) in [
+            ("a = [1, 2", "]", "array value"),
+            ("a = [", "]", "array value"),
+            ("a = { x = 1", "}", "table value"),
+            ("a = {", "}", "table value"),
+            ("a: array[string", "]", "array type definition"),
+            ("a: table{ x: string", "}", "table type definition"),
+        ] {
+            let err = assert_unterminated(input);
+            let crate::error::Error::Unterminated {
+                expected, context, ..
+            } = &err
+            else {
+                unreachable!()
+            };
+            assert_eq!(expected, expected_delim, "for {input:?}");
+            assert!(context.contains(context_part), "for {input:?}: {context}");
+        }
+    }
+
+    #[test]
+    fn valid_documents_still_parse() {
+        for input in [
+            "",
+            "   \n\t\n",
+            "# comment only\n",
+            "/* block comment */\n",
+            "a = 1\n",
+            "a = 1\n# trailing comment\n",
+            "node {}\n",
+            "a {}\nb {}\n",
+            "outer { inner { count = 1 } }\n",
+            "node {\n  # only a comment\n}\n",
+            "node {\n  # comment with }\n  s = \"has } inside\"\n}\n",
+        ] {
+            parser!(input)
+                .parse()
+                .unwrap_or_else(|e| panic!("expected {input:?} to parse, got: {e}"));
+        }
+    }
+
+    #[test]
+    fn brace_in_comment_or_string_does_not_close_block() {
+        assert_unterminated("node {\n  # }\n");
+        assert_unterminated("node {\n  s = \"}\"\n");
+    }
+
+    #[test]
+    fn extra_and_mismatched_delimiters_rejected() {
+        assert!(parser!("a = 1\n}\n").parse().is_err());
+        assert!(parser!("node {}\n}\n").parse().is_err());
+        assert!(parser!("a = [1, 2}\n").parse().is_err());
+        assert!(parser!("a = { x = 1]\n").parse().is_err());
+    }
+
+    #[test]
+    fn unterminated_comment_inside_block_is_error() {
+        assert!(parser!("node {\n# unterminated comment").parse().is_err());
+    }
+
+    #[test]
+    fn truncation_sweep_is_deterministic() {
+        // truncating a valid nested document at every char boundary either
+        // fails (deterministically, no panic/hang) or remains a valid root
+        let doc =
+            "a = 1\nouter {\n  inner {\n    count = 1\n    tags = [\"x\", \"y\"]\n  }\n}\nb = 2\n";
+        let mut valid_boundaries = 0;
+        for (idx, _) in doc.char_indices() {
+            if parser!(&doc[..idx]).parse().is_ok() {
+                valid_boundaries += 1;
+            }
+        }
+        // the empty prefix and the full document stay valid
+        assert!(valid_boundaries >= 2);
+        parser!(doc).parse().unwrap();
+    }
+
+    #[test]
+    fn unterminated_distinct_from_recursion_limit() {
+        let mut input = String::new();
+        for _ in 0..8 {
+            input.push_str("a { ");
+        }
+        let err = assert_unterminated(&input);
+        assert!(
+            !matches!(err, crate::error::Error::RecursionLimit { .. }),
+            "delimiter failure must not be reported as a recursion limit"
+        );
     }
 }

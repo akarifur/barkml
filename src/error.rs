@@ -74,6 +74,15 @@ pub enum Error {
     InvalidEscape { location: Location, escape: String },
     #[snafu(display("{location} - malformed interpolation placeholder: {reason}"))]
     Placeholder { location: Location, reason: String },
+    #[snafu(display(
+        "{eof} - syntax error: missing '{expected}' to close {context} opened at {open}"
+    ))]
+    Unterminated {
+        open: Location,
+        expected: String,
+        eof: Location,
+        context: String,
+    },
     #[snafu(display("{location} - syntax error: expected {expected}, found {got}\n{context}"))]
     Expected {
         location: Location,

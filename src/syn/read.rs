@@ -11,6 +11,9 @@ pub trait Read<'source> {
     fn next(&mut self) -> Result<Option<Token>>;
     fn discard(&mut self);
     fn location(&mut self) -> Location;
+    /// Location of the true end of input, derived from the complete source
+    /// (not the last consumed token). Valid once the stream is exhausted.
+    fn eof_location(&mut self) -> Location;
 }
 
 pub struct TokenReader<'source> {
@@ -87,5 +90,17 @@ impl<'source> Read<'source> for TokenReader<'source> {
 
     fn location(&mut self) -> Location {
         self.location.clone()
+    }
+
+    fn eof_location(&mut self) -> Location {
+        let end = self.lexer.source().len();
+        Location {
+            module: Some(self.module_name.clone()),
+            line: self.lexer.extras.line,
+            column: end.saturating_sub(self.lexer.extras.column),
+            source_text: None,
+            length: 0,
+            file_path: self.location.file_path.clone(),
+        }
     }
 }
