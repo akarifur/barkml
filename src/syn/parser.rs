@@ -410,6 +410,9 @@ impl<'source> Parser<'source> {
                     }
                 );
                 let mut children = IndexMap::new();
+                // Scope-local key -> key-token locations for duplicate
+                // diagnostics (mirrors the table value path).
+                let mut key_locations: IndexMap<String, Location> = IndexMap::new();
                 while let Some(tok) = self.tokens.peek()? {
                     match tok {
                         Token::Comma(_) => {
@@ -421,10 +424,11 @@ impl<'source> Parser<'source> {
                             break;
                         }
                         _ => {
-                            let id = self.tokens.next()?.context(error::EofSnafu {
+                            let id_tok = self.tokens.next()?.context(error::EofSnafu {
                                 location: self.tokens.location(),
                             })?;
-                            let id = match id {
+                            let id_loc = id_tok.location(Some(self.tokens.module_name.clone()));
+                            let id = match id_tok {
                                 Token::Identifier((_, id)) => Ok(id.clone()),
                                 t @ (Token::String(..)
                                 | Token::DQString(..)
@@ -458,6 +462,16 @@ impl<'source> Parser<'source> {
                                 }
                             );
                             let subtype = self.value_type()?;
+                            if let Some(original) = key_locations.get(&id) {
+                                return error::DuplicateDeclarationSnafu {
+                                    id,
+                                    labels: Vec::new(),
+                                    original: original.clone(),
+                                    duplicate: id_loc,
+                                }
+                                .fail();
+                            }
+                            key_locations.insert(id.clone(), id_loc);
                             children.insert(id, subtype);
                         }
                     }
@@ -713,6 +727,10 @@ impl<'source> Parser<'source> {
             Token::LBrace(location) => {
                 let mut children = IndexMap::new();
                 let mut child_types = IndexMap::new();
+                // Scope-local map of table key -> key token location, kept so
+                // duplicate diagnostics report the key position rather than
+                // the value position after `=`.
+                let mut key_locations: IndexMap<String, Location> = IndexMap::new();
                 while let Some(token) = self.tokens.peek()? {
                     match token {
                         Token::Comma(_) => {
@@ -779,6 +797,20 @@ impl<'source> Parser<'source> {
                             );
 
                             let (child, child_type) = self.value()?;
+                            // Reject the duplicate before touching either the
+                            // value map or the type map so no entry is
+                            // overwritten and distinct keys keep their order
+                            // and metadata.
+                            if let Some(original) = key_locations.get(&id.1) {
+                                return error::DuplicateDeclarationSnafu {
+                                    id: id.1.clone(),
+                                    labels: Vec::new(),
+                                    original: original.clone(),
+                                    duplicate: id.0.clone(),
+                                }
+                                .fail();
+                            }
+                            key_locations.insert(id.1.clone(), id.0.clone());
                             children.insert(id.1.clone(), child);
                             child_types.insert(id.1, vtype.unwrap_or(child_type));
                         }
@@ -809,14 +841,17 @@ impl<'source> Parser<'source> {
         }
     }
 
-    fn statement(&mut self) -> Result<Statement> {
+    fn statement(&mut self) -> Result<(Statement, Location)> {
         self.enter_recursion()?;
         let result = self.statement_impl();
         self.exit_recursion();
         result
     }
 
-    fn statement_impl(&mut self) -> Result<Statement> {
+    /// Parses one statement, returning it together with the location of its
+    /// declaring token (the identifier or string that names it). Parents use
+    /// that location for duplicate-declaration diagnostics.
+    fn statement_impl(&mut self) -> Result<(Statement, Location)> {
         let meta = self.metadata()?;
 
         let token = self.tokens.next()?.context(error::EofSnafu {
@@ -901,7 +936,7 @@ impl<'source> Parser<'source> {
                                 );
                             }
 
-                            Ok(Statement::new_assign(id.as_str(), type_, value, meta)?)
+                            Ok((Statement::new_assign(id.as_str(), type_, value, meta)?, loc))
                         }
 
                         _ => {
@@ -926,9 +961,12 @@ impl<'source> Parser<'source> {
                                             &t,
                                             &self.tokens.module_name.clone(),
                                         )?;
-                                        let loc = t.location(Some(self.tokens.module_name.clone()));
-                                        let value =
-                                            Value::new(Data::String(label), Metadata::new(loc));
+                                        let label_loc =
+                                            t.location(Some(self.tokens.module_name.clone()));
+                                        let value = Value::new(
+                                            Data::String(label),
+                                            Metadata::new(label_loc),
+                                        );
                                         labels.push(value);
                                         self.tokens.discard();
                                     }
@@ -962,6 +1000,7 @@ impl<'source> Parser<'source> {
 
                             // Parse block contents
                             let mut children = IndexMap::with_capacity(8);
+                            let mut key_locations = IndexMap::with_capacity(8);
                             while let Some(stmt) = self.tokens.peek()? {
                                 match stmt {
                                     Token::RBrace(_) => {
@@ -969,13 +1008,21 @@ impl<'source> Parser<'source> {
                                         break;
                                     }
                                     _ => {
-                                        let value = self.statement()?;
-                                        children.insert(value.storage_key(), value);
+                                        let (value, key_location) = self.statement()?;
+                                        Self::insert_child(
+                                            &mut children,
+                                            &mut key_locations,
+                                            value,
+                                            key_location,
+                                        )?;
                                     }
                                 }
                             }
 
-                            Ok(Statement::new_block(id.as_str(), labels, children, meta))
+                            Ok((
+                                Statement::new_block(id.as_str(), labels, children, meta),
+                                loc,
+                            ))
                         }
                     }
                 } else {
@@ -1012,6 +1059,7 @@ impl<'source> Parser<'source> {
     fn module_impl(&mut self) -> Result<Statement> {
         let parent_meta = self.metadata()?;
         let mut children = IndexMap::with_capacity(16); // Pre-allocate with reasonable capacity
+        let mut key_locations = IndexMap::with_capacity(16);
 
         while let Some(token) = self.tokens.peek()? {
             let _ = self.metadata()?;
@@ -1031,13 +1079,63 @@ impl<'source> Parser<'source> {
                     .fail();
                 }
                 _ => {
-                    let value = self.statement()?;
-                    children.insert(value.storage_key(), value);
+                    let (value, key_location) = self.statement()?;
+                    Self::insert_child(&mut children, &mut key_locations, value, key_location)?;
                 }
             }
         }
 
         Ok(Statement::new_module(".", children, parent_meta))
+    }
+
+    /// Inserts a child statement into a scope's child map, rejecting a
+    /// duplicate identity first.
+    ///
+    /// Identity is the statement id plus the ordered sequence of decoded
+    /// string labels (`Statement::identity`) — never a formatted or
+    /// dot-joined display string, and never the storage key (labeled blocks
+    /// key by uid so same-kind siblings with distinct labels coexist).
+    /// `key_locations` is a scope-local side map from storage key to the
+    /// declaring token's location, kept next to `children` so diagnostics
+    /// report key/header positions instead of value positions. The duplicate
+    /// check runs before any insertion, so the earlier declaration and its
+    /// metadata survive untouched when an error is returned.
+    fn insert_child(
+        children: &mut IndexMap<String, Statement>,
+        key_locations: &mut IndexMap<String, Location>,
+        stmt: Statement,
+        key_location: Location,
+    ) -> Result<()> {
+        let storage_key = stmt.storage_key();
+        let (id, labels) = stmt.identity();
+        let same_identity = |existing: &Statement| {
+            let (child_id, child_labels) = existing.identity();
+            child_id == id
+                && child_labels.len() == labels.len()
+                && child_labels
+                    .iter()
+                    .zip(labels.iter())
+                    .all(|(a, b)| a.as_string() == b.as_string())
+        };
+        if let Some((existing_key, _)) = children.iter().find(|(_, child)| same_identity(child)) {
+            let original = key_locations
+                .get(existing_key)
+                .cloned()
+                .expect("key_locations tracks every child inserted by insert_child");
+            return error::DuplicateDeclarationSnafu {
+                id: id.to_string(),
+                labels: labels
+                    .iter()
+                    .filter_map(|label| label.as_string().map(|s| s.to_string()))
+                    .collect::<Vec<String>>(),
+                original,
+                duplicate: key_location,
+            }
+            .fail();
+        }
+        key_locations.insert(storage_key.clone(), key_location);
+        children.insert(storage_key, stmt);
+        Ok(())
     }
 }
 
@@ -1406,7 +1504,7 @@ mod test {
         ] {
             println!("testing: {case}");
             let mut parser = parser!(case);
-            assert_eq!(parser.statement().unwrap(), expected);
+            assert_eq!(parser.statement().unwrap().0, expected);
         }
     }
 
@@ -1656,5 +1754,181 @@ mod test {
                 ("app".to_string(), vec!["a".to_string(), "b".to_string()]),
             ]
         );
+    }
+
+    // ---- duplicate declaration rejection ----
+
+    use crate::error::Error;
+
+    /// Runs `input` through a full parse and asserts it fails with
+    /// `DuplicateDeclaration` for `expected_id`, returning the error for
+    /// field-level assertions.
+    fn duplicate_error(input: &str, expected_id: &str) -> Error {
+        let mut parser = parser!(input);
+        let err = parser
+            .parse()
+            .err()
+            .unwrap_or_else(|| panic!("expected duplicate error for: {input}"));
+        match err {
+            Error::DuplicateDeclaration { ref id, .. } => {
+                assert_eq!(id, expected_id, "for input {input:?}");
+                err
+            }
+            other => panic!("expected DuplicateDeclaration for {input:?}, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_root_assignments_rejected() {
+        // differing values
+        duplicate_error("count = 1\ncount = 2\n", "count");
+        // same value
+        duplicate_error("count = 1\ncount = 1\n", "count");
+        // differing types
+        duplicate_error("name = \"a\"\nname = 2\n", "name");
+        // quoted and unquoted equivalent keys collide
+        duplicate_error("name = \"a\"\n\"name\" = \"b\"\n", "name");
+        // intervening comments
+        duplicate_error("count = 1\n# a comment\n# another\ncount = 2\n", "count");
+        // multiline input with far separation
+        duplicate_error(
+            "a = 1\nb = 2\nc = 3\nd = 4\ncount = 1\na2 = 1\nb2 = 2\nc2 = 3\ncount = 2\n",
+            "count",
+        );
+    }
+
+    #[test]
+    fn duplicate_root_assignment_reports_both_locations() {
+        let err = duplicate_error("count = 1\ncount = 2\n", "count");
+        match err {
+            Error::DuplicateDeclaration {
+                original,
+                duplicate,
+                ..
+            } => {
+                assert_eq!(original.source_text.as_deref(), Some("count"));
+                assert_eq!(duplicate.source_text.as_deref(), Some("count"));
+                assert_eq!(original.module.as_deref(), Some("root"));
+                assert_eq!(duplicate.module.as_deref(), Some("root"));
+                assert!(original.line < duplicate.line, "{original} vs {duplicate}");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn duplicate_assignment_inside_block_rejected() {
+        duplicate_error("parent {\n  count = 1\n  count = 2\n}\n", "count");
+        duplicate_error("parent \"x\" {\n  a = 1\n  a = 2\n}\n", "a");
+    }
+
+    #[test]
+    fn duplicate_table_keys_rejected() {
+        duplicate_error("t = { a = 1, a = 2 }\n", "a");
+        duplicate_error("t = { a = 1, a = 1 }\n", "a");
+        // duplicate table *type* members
+        duplicate_error("t: table{a: string, a: int} = {}\n", "a");
+        duplicate_error("t: table{a: string, \"a\": int} = {}\n", "a");
+        // quoted vs unquoted equivalent keys
+        duplicate_error("t = { a = 1, \"a\" = 2 }\n", "a");
+        // equivalent escape spellings unify
+        duplicate_error("t = { \"a\\nb\" = 1, \"a\\nb\" = 2 }\n", "a\nb");
+        // nested tables
+        duplicate_error("t = { inner = { a = 1, a = 2 } }\n", "a");
+        duplicate_error("t = {\n  a = 1\n  a = 2\n}\n", "a");
+        // same key nested under two different parents is fine
+        parser!("t = { inner = { a = 1 }, other = { a = 2 } }\n")
+            .parse()
+            .unwrap();
+    }
+
+    #[test]
+    fn duplicate_table_key_reports_key_locations() {
+        let err = duplicate_error("t = {\n  a = 1\n  a = 2\n}\n", "a");
+        match err {
+            Error::DuplicateDeclaration {
+                original,
+                duplicate,
+                ..
+            } => {
+                assert_eq!(original.source_text.as_deref(), Some("a"));
+                assert_eq!(duplicate.source_text.as_deref(), Some("a"));
+                assert!(original.line < duplicate.line);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn duplicate_block_identities_rejected() {
+        // unlabeled duplicates at root and inside a parent
+        duplicate_error("app {\n}\napp {\n}\n", "app");
+        duplicate_error("parent {\n  app {\n  }\n  app {\n  }\n}\n", "app");
+        // identical labels in the same order
+        duplicate_error("app \"a\" \"b\" {\n}\napp \"a\" \"b\" {\n}\n", "app");
+        // label order matters: reversed order is still a duplicate pair when identical
+        duplicate_error("app \"a\" \"b\" {\n}\napp \"a\" \"b\" {\n}\n", "app");
+        // error carries the full ordered labels
+        let err = duplicate_error("app \"a\" \"b\" {\n}\napp \"a\" \"b\" {\n}\n", "app");
+        match err {
+            Error::DuplicateDeclaration { labels, .. } => {
+                assert_eq!(labels, vec!["a".to_string(), "b".to_string()]);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn distinct_block_identities_accepted() {
+        // distinct labels on the same kind
+        parser!("app \"a\" {\n}\napp \"b\" {\n}\n").parse().unwrap();
+        // reversed label order is a distinct identity, not a duplicate
+        parser!("app \"a\" \"b\" {\n}\napp \"b\" \"a\" {\n}\n")
+            .parse()
+            .unwrap();
+        // one label "a.b" vs two labels "a" "b"
+        parser!("app \"a.b\" {\n}\napp \"a\" \"b\" {\n}\n")
+            .parse()
+            .unwrap();
+        // same labeled block under different parents
+        parser!("p1 {\n  app \"a\" {\n  }\n}\np2 {\n  app \"a\" {\n  }\n}\n")
+            .parse()
+            .unwrap();
+        // escaped quotes in labels; equal decoded strings with different
+        // escape spellings are duplicates
+        parser!("app \"say \\\"hi\\\"\" {\n}\napp \"other\" {\n}\n")
+            .parse()
+            .unwrap();
+    }
+
+    #[test]
+    fn equivalent_label_escapes_are_duplicates() {
+        duplicate_error("app \"tab\\u{9}end\" {\n}\napp \"tab\tend\" {\n}\n", "app");
+    }
+
+    #[test]
+    fn duplicate_state_does_not_leak_between_scopes_or_parses() {
+        // same field under two different parents in one document
+        parser!("p1 {\n  shared = 1\n}\np2 {\n  shared = 2\n}\n")
+            .parse()
+            .unwrap();
+        // a rejected parse is followed by a clean parse of the same parser
+        // name succeeding: each Parser instance is independent
+        let mut bad = parser!("count = 1\ncount = 2\n");
+        assert!(bad.parse().is_err());
+        let mut good = parser!("count = 1\n");
+        assert!(good.parse().is_ok());
+        // same table key under two separate tables in one document
+        parser!("t1 = { a = 1 }\nt2 = { a = 2 }\n").parse().unwrap();
+    }
+
+    #[test]
+    fn assignment_vs_block_namespace() {
+        // an assignment and a zero-label block share the id namespace in one
+        // scope: the second declaration of "x" is a duplicate
+        duplicate_error("x = 1\nx {\n}\n", "x");
+        duplicate_error("x {\n}\nx = 1\n", "x");
+        // a labeled block never collides with an assignment of the same name
+        parser!("x = 1\nx \"a\" {\n}\n").parse().unwrap();
     }
 }

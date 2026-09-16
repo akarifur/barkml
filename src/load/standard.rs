@@ -664,4 +664,54 @@ mod tests {
         assert!(result.find_by_path("section-1.number").is_some());
         assert!(result.find_by_path("section-2.number").is_some());
     }
+
+    #[test]
+    fn layered_merge_respects_collision_setting() {
+        use std::io::Cursor;
+
+        let base = b"name = \"base\"\n";
+        let overlay = b"name = \"overlay\"\n";
+
+        // Permissive merge of two separate sources succeeds (overlay wins)
+        let mut loader = StandardLoader::builder().allow_collisions(true).build();
+        loader
+            .add_module("main", &mut Cursor::new(base.to_vec()), None)
+            .unwrap();
+        loader
+            .add_module("main", &mut Cursor::new(overlay.to_vec()), None)
+            .unwrap();
+        let merged = loader.load().unwrap();
+        assert!(merged.find_by_path("name").is_some());
+
+        // Strict merge of the same clean sources fails with a merge collision
+        let mut loader = StandardLoader::default();
+        loader
+            .add_module("main", &mut Cursor::new(base.to_vec()), None)
+            .unwrap();
+        let err = loader
+            .add_module("main", &mut Cursor::new(overlay.to_vec()), None)
+            .err()
+            .unwrap();
+        assert!(matches!(err, error::Error::Collision { .. }), "got: {err}");
+    }
+
+    #[test]
+    fn duplicate_inside_one_source_fails_regardless_of_collision_setting() {
+        use std::io::Cursor;
+
+        let source = b"count = 1\ncount = 2\n";
+        for allow in [true, false] {
+            let mut loader = StandardLoader::builder().allow_collisions(allow).build();
+            let err = loader
+                .add_module("main", &mut Cursor::new(source.to_vec()), None)
+                .err()
+                .unwrap_or_else(|| panic!("duplicate must fail with allow_collisions={allow}"));
+            // parse_file wraps parser errors in Io; the duplicate diagnosis
+            // is still carried through the message
+            assert!(
+                err.to_string().contains("duplicate declaration"),
+                "got: {err}"
+            );
+        }
+    }
 }

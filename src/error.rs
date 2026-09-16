@@ -42,6 +42,18 @@ pub enum Error {
         source: base64::DecodeError,
     },
     #[snafu(display(
+        "{duplicate} - duplicate declaration of '{}'{label_suffix}: already declared at {original}",
+        id,
+        label_suffix = if labels.is_empty() { String::new() } else { format!(" {}", labels.join(" ")) }
+    ))]
+    DuplicateDeclaration {
+        id: String,
+        /// Ordered decoded string labels; empty for assignments and table keys
+        labels: Vec<String>,
+        original: Location,
+        duplicate: Location,
+    },
+    #[snafu(display(
         "name collision between {left_id} ({left_location}) and {right_id} ({right_location})"
     ))]
     Collision {
