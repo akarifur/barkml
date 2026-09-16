@@ -81,30 +81,71 @@ impl StandardLoader {
         self.file_cache.len()
     }
 
-    /// Merges the contents of the right statement into the left statement with enhanced error handling
+    /// Merges a source statement into the stored module `dest_key` transactionally
     ///
-    /// This function recursively merges two statements, handling different statement types
-    /// and respecting the collision policy. It provides detailed error information
-    /// and supports partial merging with rollback on failure.
+    /// # Transaction boundary
+    ///
+    /// One source-to-destination merge is atomic. The fallible merge runs against
+    /// a staged copy of only the affected destination module; on success the staged
+    /// copy is swapped in (an infallible commit), and on failure the stored module
+    /// is left completely unchanged — values, children, insertion order, labels,
+    /// metadata, and UIDs. The source is never modified. If no module exists under
+    /// `dest_key`, the source is inserted directly, which is trivially atomic.
+    ///
+    /// This guarantee covers every path that merges modules: `add_module`,
+    /// `import`, `add_file` (including cache hits), and directory APIs through
+    /// them. Directory APIs (`import_dir`, `add_dir`) are atomic **per file**:
+    /// a later file's failure retains earlier successful file merges; there is
+    /// no whole-directory rollback.
+    ///
+    /// Caching and statistics are not part of the rollback: a successfully
+    /// parsed source may remain in the file cache after a conflicting merge,
+    /// and `files_processed`/`modules_created` count parses and module
+    /// creations respectively, not merge outcomes.
+    fn merge_module_transactional(&mut self, dest_key: &str, source: &Statement) -> Result<()> {
+        match self.modules.get_mut(dest_key) {
+            Some(existing) => {
+                // Stage once: run the fallible merge on a copy of the affected
+                // module only, then commit by swapping it in.
+                let mut staged = existing.clone();
+                Self::merge_into_staged(&mut staged, source, self.config.allow_collisions)?;
+                self.modules.insert(dest_key.to_string(), staged);
+                Ok(())
+            }
+            None => {
+                self.modules.insert(dest_key.to_string(), source.clone());
+                self.stats.modules_created += 1;
+                Ok(())
+            }
+        }
+    }
+
+    /// Recursively merges `right` into `staged`, respecting the collision policy
+    ///
+    /// This is the fallible half of the transactional merge in
+    /// [`merge_module_transactional`](Self::merge_module_transactional): it
+    /// mutates `staged` destructively and may fail partway, leaving `staged`
+    /// partially merged. Callers must only ever pass a disposable staged copy
+    /// and publish it on `Ok`.
     ///
     /// # Arguments
     ///
-    /// * `left` - The target statement to merge into (modified in-place)
-    /// * `right` - The source statement to merge from
+    /// * `staged` - The staged statement to merge into (modified in-place)
+    /// * `right` - The source statement to merge from (never modified)
     /// * `allow_collisions` - Whether to allow collisions (overwrite on conflict)
     ///
     /// # Returns
     ///
     /// Ok(()) if the merge was successful, or an error if there was a collision
     /// and collisions are not allowed
-    fn merge_statements(
-        left: &mut Statement,
+    fn merge_into_staged(
+        staged: &mut Statement,
         right: &Statement,
         allow_collisions: bool,
     ) -> Result<()> {
         match &right.data {
             StatementData::Group(right_stmts) | StatementData::Labeled(_, right_stmts) => {
-                match &mut left.data {
+                match &mut staged.data {
                     StatementData::Group(left_stmts) | StatementData::Labeled(_, left_stmts) => {
                         // Pre-allocate capacity for better performance
                         let additional_capacity =
@@ -117,7 +158,7 @@ impl StandardLoader {
                         for (key, value) in right_stmts {
                             if let Some(target) = left_stmts.get_mut(key) {
                                 // Recursive merge for existing keys
-                                Self::merge_statements(target, value, allow_collisions)?;
+                                Self::merge_into_staged(target, value, allow_collisions)?;
                             } else {
                                 // Simple insert for new keys
                                 left_stmts.insert(key.clone(), value.clone());
@@ -129,13 +170,13 @@ impl StandardLoader {
                         ensure!(
                             allow_collisions,
                             error::CollisionSnafu {
-                                left_id: left.id.clone(),
-                                left_location: left.meta.location.clone(),
+                                left_id: staged.id.clone(),
+                                left_location: staged.meta.location.clone(),
                                 right_id: right.id.clone(),
                                 right_location: right.meta.location.clone()
                             }
                         );
-                        *left = right.clone();
+                        *staged = right.clone();
                     }
                 }
             }
@@ -144,13 +185,13 @@ impl StandardLoader {
                 ensure!(
                     allow_collisions,
                     error::CollisionSnafu {
-                        left_id: left.id.clone(),
-                        left_location: left.meta.location.clone(),
+                        left_id: staged.id.clone(),
+                        left_location: staged.meta.location.clone(),
                         right_id: right.id.clone(),
                         right_location: right.meta.location.clone()
                     }
                 );
-                *left = right.clone();
+                *staged = right.clone();
             }
         }
         Ok(())
@@ -218,12 +259,7 @@ impl StandardLoader {
     {
         let module = self.parse_file(name, code, filename)?;
 
-        if let Some(existing) = self.modules.get_mut(name) {
-            Self::merge_statements(existing, &module, self.config.allow_collisions)?;
-        } else {
-            self.modules.insert(name.to_string(), module);
-            self.stats.modules_created += 1;
-        }
+        self.merge_module_transactional(name, &module)?;
 
         Ok(self)
     }
@@ -238,14 +274,9 @@ impl StandardLoader {
 
         let name = utils::basename(path)?;
 
-        // Check cache first
-        if let Some(cached_module) = self.file_cache.get(path) {
-            if let Some(existing) = self.modules.get_mut(&name) {
-                Self::merge_statements(existing, cached_module, self.config.allow_collisions)?;
-            } else {
-                self.modules.insert(name, cached_module.clone());
-                self.stats.modules_created += 1;
-            }
+        // Check cache first (merge is transactional either way)
+        if let Some(cached_module) = self.file_cache.get(path).cloned() {
+            self.merge_module_transactional(&name, &cached_module)?;
             return Ok(self);
         }
 
@@ -258,13 +289,7 @@ impl StandardLoader {
         let module = self.parse_file(&name, &mut file, Some(name.clone()))?;
         self.file_cache.insert(path.to_path_buf(), module.clone());
 
-        // Add to modules
-        if let Some(existing) = self.modules.get_mut(&name) {
-            Self::merge_statements(existing, &module, self.config.allow_collisions)?;
-        } else {
-            self.modules.insert(name, module);
-            self.stats.modules_created += 1;
-        }
+        self.merge_module_transactional(&name, &module)?;
 
         Ok(self)
     }
@@ -279,15 +304,9 @@ impl StandardLoader {
 
         let name = utils::basename(path)?;
 
-        // Check cache first
-        if let Some(cached_module) = self.file_cache.get(path) {
-            if let Some(existing) = self.modules.get_mut("main") {
-                Self::merge_statements(existing, cached_module, self.config.allow_collisions)?;
-            } else {
-                self.modules
-                    .insert("main".to_string(), cached_module.clone());
-                self.stats.modules_created += 1;
-            }
+        // Check cache first (merge is transactional either way)
+        if let Some(cached_module) = self.file_cache.get(path).cloned() {
+            self.merge_module_transactional("main", &cached_module)?;
             return Ok(self);
         }
 
@@ -300,18 +319,18 @@ impl StandardLoader {
         let module = self.parse_file("main", &mut file, Some(name))?;
         self.file_cache.insert(path.to_path_buf(), module.clone());
 
-        // Add to main module
-        if let Some(existing) = self.modules.get_mut("main") {
-            Self::merge_statements(existing, &module, self.config.allow_collisions)?;
-        } else {
-            self.modules.insert("main".to_string(), module);
-            self.stats.modules_created += 1;
-        }
+        self.merge_module_transactional("main", &module)?;
 
         Ok(self)
     }
 
     /// Add a directory to this loader and import all files as individual modules
+    ///
+    /// # Transaction boundary
+    ///
+    /// Each file is imported atomically: if one file's merge fails, that file is
+    /// fully unmerged, but earlier successful imports are retained. There is no
+    /// whole-directory rollback. Files are processed in sorted order.
     pub fn import_dir<P>(&mut self, path: P) -> Result<&mut Self>
     where
         P: AsRef<Path>,
@@ -329,6 +348,12 @@ impl StandardLoader {
     }
 
     /// Add a directory to this loader and merge all files into the main module
+    ///
+    /// # Transaction boundary
+    ///
+    /// Each file's merge into `main` is atomic: if one file fails, that file is
+    /// fully unmerged, but earlier successful file merges are retained in `main`.
+    /// There is no whole-directory rollback. Files are processed in sorted order.
     pub fn add_dir<P>(&mut self, path: P) -> Result<&mut Self>
     where
         P: AsRef<Path>,
@@ -717,5 +742,263 @@ mod tests {
                 "got: {err}"
             );
         }
+    }
+
+    // ---- transactional merge regressions ----
+
+    use std::io::Cursor;
+
+    /// Full structural + metadata equality, unlike `PartialEq for Statement`
+    /// which ignores uid/type_/meta. Debug output of IndexMap preserves
+    /// insertion order, so this also pins exact child ordering.
+    fn assert_fully_identical(a: &Statement, b: &Statement) {
+        assert_eq!(
+            format!("{a:?}"),
+            format!("{b:?}"),
+            "destination changed: metadata, uid, or ordering diverged"
+        );
+    }
+
+    fn child_order(s: &Statement) -> Vec<String> {
+        match &s.data {
+            StatementData::Group(m) | StatementData::Labeled(_, m) => m.keys().cloned().collect(),
+            StatementData::Single(_) => vec![],
+        }
+    }
+
+    fn cursor(s: &str) -> Cursor<Vec<u8>> {
+        Cursor::new(s.as_bytes().to_vec())
+    }
+
+    fn snapshot_main(loader: &StandardLoader) -> Statement {
+        loader.get_module("main").expect("main must exist").clone()
+    }
+
+    #[test]
+    fn failed_merge_preserves_destination_completely() {
+        let mut loader = StandardLoader::default();
+        loader
+            .add_module("main", &mut cursor("a = 1\nb = 2\nnest { x = 1 }"), None)
+            .unwrap();
+        let before = snapshot_main(&loader);
+
+        // new child first, nested addition second, conflicting value last
+        let err = loader
+            .add_module(
+                "main",
+                &mut cursor("newkey = 9\nnest { y = 2 }\na = 5"),
+                None,
+            )
+            .err()
+            .expect("conflicting merge must fail");
+        assert!(matches!(err, error::Error::Collision { .. }), "got: {err}");
+
+        let after = snapshot_main(&loader);
+        assert_fully_identical(&before, &after);
+        assert_eq!(child_order(&after), child_order(&before));
+    }
+
+    #[test]
+    fn deep_conflict_and_shape_mismatches_are_atomic() {
+        let mut loader = StandardLoader::default();
+        loader
+            .add_module(
+                "main",
+                &mut cursor("root = 1\nlvl1 { lvl2 { deep = 1\nother = 2 } }"),
+                None,
+            )
+            .unwrap();
+        let before = snapshot_main(&loader);
+
+        // conflict several levels down, after root and nested additions
+        let err = loader
+            .add_module(
+                "main",
+                &mut cursor("newroot = 2\nlvl1 { newchild = 1\nlvl2 { newdeep = 3\ndeep = 9 } }"),
+                None,
+            )
+            .err()
+            .expect("deep conflict must fail");
+        match err {
+            error::Error::Collision {
+                left_id, right_id, ..
+            } => {
+                assert_eq!(left_id, "deep");
+                assert_eq!(right_id, "deep");
+            }
+            other => panic!("expected Collision, got: {other}"),
+        }
+        assert_fully_identical(&before, &snapshot_main(&loader));
+
+        // group-over-value shape mismatch
+        let mut loader = StandardLoader::default();
+        loader
+            .add_module("main", &mut cursor("val = 1"), None)
+            .unwrap();
+        let before = snapshot_main(&loader);
+        let err = loader
+            .add_module("main", &mut cursor("val { a = 1 }"), None)
+            .err()
+            .expect("value-over-group mismatch must fail");
+        match err {
+            error::Error::Collision {
+                left_id, right_id, ..
+            } => {
+                assert_eq!(left_id, "val");
+                assert_eq!(right_id, "val");
+            }
+            other => panic!("expected Collision, got: {other}"),
+        }
+        assert_fully_identical(&before, &snapshot_main(&loader));
+
+        // value-over-group shape mismatch
+        let mut loader = StandardLoader::default();
+        loader
+            .add_module("main", &mut cursor("grp { a = 1 }"), None)
+            .unwrap();
+        let before = snapshot_main(&loader);
+        assert!(
+            loader
+                .add_module("main", &mut cursor("grp = 5"), None)
+                .is_err()
+        );
+        assert_fully_identical(&before, &snapshot_main(&loader));
+    }
+
+    #[test]
+    fn retry_after_failure_leaves_no_leftovers() {
+        let mut loader = StandardLoader::default();
+        loader
+            .add_module("main", &mut cursor("a = 1"), None)
+            .unwrap();
+        let before = snapshot_main(&loader);
+
+        let failing = "newkey = 9\na = 5";
+        let source = failing.as_bytes().to_vec();
+        assert!(
+            loader
+                .add_module("main", &mut Cursor::new(source.clone()), None)
+                .is_err()
+        );
+        // source not consumed/mutated by failure
+        assert_eq!(source, failing.as_bytes().to_vec());
+
+        assert_fully_identical(&before, &snapshot_main(&loader));
+
+        // corrected retry succeeds and contains nothing from the failed attempt
+        loader
+            .add_module("main", &mut cursor("newkey = 9\nsafe = 2"), None)
+            .unwrap();
+        let after = snapshot_main(&loader);
+        assert_eq!(child_order(&after), vec!["a", "newkey", "safe"]);
+    }
+
+    #[test]
+    fn successful_merge_semantics_preserved() {
+        // disjoint merge preserves children and order
+        let mut loader = StandardLoader::default();
+        loader
+            .add_module("main", &mut cursor("a = 1\nb = 2\nnest { x = 1 }"), None)
+            .unwrap();
+        loader
+            .add_module("main", &mut cursor("nest { y = 2 }\nc = 3"), None)
+            .unwrap();
+        let m = snapshot_main(&loader);
+        assert_eq!(child_order(&m), vec!["a", "b", "nest", "c"]);
+        assert_eq!(
+            child_order(m.children().find(|s| s.id == "nest").unwrap()),
+            vec!["x", "y"]
+        );
+
+        // collision-enabled overwrite (including shape mismatch) retains unrelated children
+        let mut loader = StandardLoader::builder().allow_collisions(true).build();
+        loader
+            .add_module("main", &mut cursor("a = 1\nkeep = 2\nval = 1"), None)
+            .unwrap();
+        loader
+            .add_module("main", &mut cursor("a = 5\nval { x = 2 }\nnew = 6"), None)
+            .unwrap();
+        let m = snapshot_main(&loader);
+        assert_eq!(child_order(&m), vec!["a", "keep", "val", "new"]);
+        assert!(m.find_by_path("a").is_some());
+        assert!(m.find_by_path("val.x").is_some());
+
+        // equal-value duplicate across layers is still a collision when disabled
+        let mut loader = StandardLoader::default();
+        loader
+            .add_module("main", &mut cursor("a = 1"), None)
+            .unwrap();
+        assert!(
+            loader
+                .add_module("main", &mut cursor("a = 1"), None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_merge_does_not_create_modules_or_count_them() {
+        let mut loader = StandardLoader::default();
+        loader
+            .add_module("main", &mut cursor("a = 1"), None)
+            .unwrap();
+        let created = loader.stats().modules_created;
+        assert!(
+            loader
+                .add_module("main", &mut cursor("a = 2"), None)
+                .is_err()
+        );
+        assert_eq!(loader.stats().modules_created, created);
+        assert_eq!(loader.module_names().len(), 1);
+    }
+
+    #[test]
+    fn file_and_directory_merges_are_atomic() {
+        let dir = std::env::temp_dir().join(format!(
+            "barkml-txn-{}-{:?}",
+            std::process::id(),
+            std::time::Instant::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("00-a.bml");
+        let file_b = dir.join("01-b.bml");
+        std::fs::write(&file_a, "shared = 1\na_only = 2").unwrap();
+        std::fs::write(&file_b, "new = 3\nshared = 5").unwrap();
+
+        // add_file: failed second file leaves only the first file's keys
+        let mut loader = StandardLoader::default();
+        loader.add_file(&file_a).unwrap();
+        let before = loader.read().unwrap();
+        assert!(loader.add_file(&file_b).is_err());
+        let after = loader.read().unwrap();
+        assert_fully_identical(&before, &after);
+        assert!(after.find_by_path("a_only").is_some());
+        assert!(after.find_by_path("new").is_none());
+
+        // add_dir: per-file atomicity, prior successful merges retained
+        let mut loader = StandardLoader::default();
+        assert!(loader.add_dir(&dir).is_err());
+        let m = loader.read().unwrap();
+        assert!(m.find_by_path("a_only").is_some());
+        assert!(m.find_by_path("shared").is_some());
+        assert!(m.find_by_path("new").is_none());
+
+        // cache-hit path: re-adding a cached file under strict mode must still
+        // collide-check and leave the destination untouched
+        let mut loader = StandardLoader::default();
+        loader.add_file(&file_a).unwrap();
+        assert_eq!(loader.cache_size(), 1);
+        let before = loader.read().unwrap();
+        assert!(loader.add_file(&file_a).is_err());
+        assert_fully_identical(&before, &loader.read().unwrap());
+
+        // import exercises the same transactional path for named modules:
+        // re-importing the same basename merges (cache hit) and must collide-check
+        let mut loader = StandardLoader::default();
+        loader.import(&file_a).unwrap();
+        let before = loader.get_module("00-a").unwrap().clone();
+        assert!(loader.import(&file_a).is_err());
+        assert_fully_identical(&before, loader.get_module("00-a").unwrap());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
