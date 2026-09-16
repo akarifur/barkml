@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/akarifur/barkml/compare/v0.9.0...v0.10.0) - 2026-09-16
+
+### Features
+
+- [**breaking**] Add explicit f-string interpolation and coherent string model
+- [**breaking**] Restrict boolean/null literals to canonical spellings
+- [**breaking**] Remove $ control statements and BMLS schema surface
+- [**breaking**] Reject duplicate declarations before insertion
+- [**breaking**] Reject unterminated blocks, tables, and arrays
+- [**breaking**] Detect reference cycles with structured dependency traces
+
+### Bug Fixes
+
+- *(ast)* Enforce configured resolution-depth limit by reference edge
+- *(load)* Make module merges transactional via staged copy
+- *(load)* Preserve structured parse errors through loading
+- Resolve review findings across parser, lexer, loader, and serde
+
+### Documentation
+
+- Pin domain-neutral grammar and embedding contract
+
+### Misc.
+
+- *(ci)* Fix changelog for releasing
+- *(ci)* Fix non created 0.9
+- Synchronize changelog config to release-plz
+- Remove unreleased so release-plz works
+- Fix changelog
+
+
 ## [0.9.0] - 2026-09-15
 
 ### Features
