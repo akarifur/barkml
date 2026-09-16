@@ -84,6 +84,7 @@ impl<'de, 'a> Deserializer<'de> for ValueDeserializer<'a> {
     {
         match &self.value.data {
             Data::I8(n) => visitor.visit_i8(*n),
+            Data::U8(n) if i64::from(*n) <= i64::from(i8::MAX) => visitor.visit_i8(*n as i8),
             Data::Signed(n) => {
                 if *n >= i64::from(i8::MIN) && *n <= i64::from(i8::MAX) {
                     visitor.visit_i8(*n as i8)
@@ -110,6 +111,8 @@ impl<'de, 'a> Deserializer<'de> for ValueDeserializer<'a> {
         match &self.value.data {
             Data::I16(n) => visitor.visit_i16(*n),
             Data::I8(n) => visitor.visit_i16(i16::from(*n)),
+            Data::U8(n) => visitor.visit_i16(i16::from(*n)),
+            Data::U16(n) if i64::from(*n) <= i64::from(i16::MAX) => visitor.visit_i16(*n as i16),
             Data::Signed(n) => {
                 if *n >= i64::from(i16::MIN) && *n <= i64::from(i16::MAX) {
                     visitor.visit_i16(*n as i16)
@@ -137,6 +140,9 @@ impl<'de, 'a> Deserializer<'de> for ValueDeserializer<'a> {
             Data::I32(n) => visitor.visit_i32(*n),
             Data::I8(n) => visitor.visit_i32(i32::from(*n)),
             Data::I16(n) => visitor.visit_i32(i32::from(*n)),
+            Data::U8(n) => visitor.visit_i32(i32::from(*n)),
+            Data::U16(n) => visitor.visit_i32(i32::from(*n)),
+            Data::U32(n) if i64::from(*n) <= i64::from(i32::MAX) => visitor.visit_i32(*n as i32),
             Data::Signed(n) => {
                 if *n >= i64::from(i32::MIN) && *n <= i64::from(i32::MAX) {
                     visitor.visit_i32(*n as i32)
@@ -165,6 +171,9 @@ impl<'de, 'a> Deserializer<'de> for ValueDeserializer<'a> {
             Data::I8(n) => visitor.visit_i64(i64::from(*n)),
             Data::I16(n) => visitor.visit_i64(i64::from(*n)),
             Data::I32(n) => visitor.visit_i64(i64::from(*n)),
+            Data::U8(n) => visitor.visit_i64(i64::from(*n)),
+            Data::U16(n) => visitor.visit_i64(i64::from(*n)),
+            Data::U32(n) => visitor.visit_i64(i64::from(*n)),
             Data::Signed(n) => visitor.visit_i64(*n),
             _ => error::TypeMismatchSnafu {
                 expected: "i64",
@@ -185,6 +194,12 @@ impl<'de, 'a> Deserializer<'de> for ValueDeserializer<'a> {
             Data::I32(n) => visitor.visit_i128(i128::from(*n)),
             Data::I64(n) => visitor.visit_i128(i128::from(*n)),
             Data::Signed(n) => visitor.visit_i128(i128::from(*n)),
+            Data::U8(n) => visitor.visit_i128(i128::from(*n)),
+            Data::U16(n) => visitor.visit_i128(i128::from(*n)),
+            Data::U32(n) => visitor.visit_i128(i128::from(*n)),
+            Data::U64(n) => visitor.visit_i128(i128::from(*n)),
+            Data::U128(n) if *n <= i128::MAX as u128 => visitor.visit_i128(*n as i128),
+            Data::Unsigned(n) => visitor.visit_i128(i128::from(*n)),
             _ => error::TypeMismatchSnafu {
                 expected: "i128",
                 found: self.value.type_of().to_string(),
@@ -345,14 +360,15 @@ impl<'de, 'a> Deserializer<'de> for ValueDeserializer<'a> {
     {
         match &self.value.data {
             Data::String(s) => {
-                if s.len() == 1 {
-                    visitor.visit_char(s.chars().next().expect("string has one character"))
-                } else {
-                    error::InvalidValueSnafu {
+                // Count chars, not bytes: non-ASCII single chars are valid
+                let mut chars = s.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) => visitor.visit_char(c),
+                    _ => error::InvalidValueSnafu {
                         value: s.to_string(),
                         expected_type: "char",
                     }
-                    .fail()
+                    .fail(),
                 }
             }
             _ => error::TypeMismatchSnafu {

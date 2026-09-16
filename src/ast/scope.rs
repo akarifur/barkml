@@ -1,4 +1,5 @@
 use super::types::{Location, StatementType, ValueType};
+use super::value::escape_string;
 use super::{Data, Statement, StatementData, TemplatePart, Value};
 use crate::{Result, error};
 use indexmap::IndexMap;
@@ -68,7 +69,7 @@ impl Segment {
                 out.push_str(
                     &bracket
                         .drain(..)
-                        .map(|x| format!("\"{}\"", x))
+                        .map(|x| format!("\"{}\"", escape_string(&x)))
                         .collect::<Vec<_>>()
                         .join(", "),
                 );
@@ -310,6 +311,10 @@ impl Scope {
     /// path and value. Selector kinds are enforced: `Key` addresses
     /// identifiers and labels, `Index` addresses array elements only.
     /// Multiple matches indicate an ambiguous selector.
+    ///
+    /// This is a linear scan filtered by exact path length; if resolution
+    /// of very large symbol tables ever becomes hot, index paths by length
+    /// (e.g. `HashMap<usize, Vec<&Path>>`) before matching.
     fn reference_matches(&self, segments: &[Segment]) -> Vec<(&Vec<Segment>, &Value)> {
         self.symbol_table
             .iter()

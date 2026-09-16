@@ -95,9 +95,6 @@ impl ValueType {
             // Exact matches are always valid
             (left, right) if left == right => true,
 
-            // String types are only compatible with other strings
-            (String, String) => true,
-
             // Signed integer compatibility
             (Signed, I8 | I16 | I32 | I64 | I128 | Signed) => true,
             (Signed, U8 | U16 | U32) => true, // Small unsigned can fit in signed
@@ -406,7 +403,7 @@ pub struct Location {
     pub column: usize,
     /// Original source text for the token
     pub source_text: Option<String>,
-    /// Length of the token in characters
+    /// Length of the token in bytes of source text
     pub length: usize,
     /// File path where the token was found
     pub file_path: Option<String>,

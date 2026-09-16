@@ -1178,7 +1178,17 @@ impl<'source> Parser<'source> {
         let mut key_locations = IndexMap::with_capacity(16);
 
         loop {
-            let _ = self.metadata()?;
+            // Mirror the block path: keep comments preceding a statement as
+            // that statement's metadata instead of discarding them.
+            if matches!(
+                self.tokens.peek()?,
+                Some(Token::LineComment(_) | Token::MultiLineComment(_))
+            ) {
+                let meta = self.metadata()?;
+                if self.tokens.peek()?.is_some() {
+                    self.pending_meta = Some(meta);
+                }
+            }
             // Re-peek after metadata(): comments were consumed, so the
             // stale peeked token must not be dispatched to statement()
             let token = match self.tokens.peek()? {
@@ -1670,6 +1680,21 @@ mod test {
         for _ in 0..100 {
             deeply_nested.push('}');
         }
+
+        let result = std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let mut parser = parser!(&deeply_nested);
+                parser.parse()
+            })
+            .expect("spawn test thread")
+            .join()
+            .expect("test thread panicked");
+        assert!(
+            matches!(result, Err(crate::Error::RecursionLimit { .. })),
+            "100-deep nesting must be rejected by the recursion guard, got {:?}",
+            result
+        );
     }
 
     #[test]

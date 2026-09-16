@@ -554,6 +554,26 @@ pub fn escape_string(input: &str) -> String {
     out
 }
 
+/// Escapes a single-quoted selector for use inside an `f"..."`
+/// placeholder: the surrounding delimiter, the string delimiter, and the
+/// f-string braces all need escaping for the output to stay re-parseable.
+fn escape_placeholder_selector(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '\'' => out.push_str("\\'"),
+            '\\' => out.push_str("\\\\"),
+            '{' => out.push_str("\\{"),
+            '}' => out.push_str("\\}"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Renders a placeholder path for an `f"..."` literal. Quoted selectors
 /// use single quotes because a double quote would end the outer literal.
 pub fn display_placeholder(segments: &[super::scope::Segment]) -> String {
@@ -567,10 +587,10 @@ pub fn display_placeholder(segments: &[super::scope::Segment]) -> String {
                 out.push_str(value);
             }
             super::scope::Segment::Key(value) => {
-                out.push_str(&format!("['{}']", value));
+                out.push_str(&format!("['{}']", escape_placeholder_selector(value)));
             }
             super::scope::Segment::Label(value) => {
-                out.push_str(&format!("['{}']", value));
+                out.push_str(&format!("['{}']", escape_placeholder_selector(value)));
             }
             super::scope::Segment::Index(index) => {
                 out.push_str(&format!("[{}]", index));

@@ -16,6 +16,26 @@ use indexmap::IndexMap;
 use logos::Logos;
 use snafu::ensure;
 
+/// Maximum unclosed `{`/`[` count in the raw source text. Nesting depth in
+/// the parsed AST can never exceed this (every recursion level — block,
+/// table, or array — needs a literal opening delimiter), so it is a safe
+/// upper bound for choosing the parse strategy.
+fn raw_nesting_depth(source: &str) -> usize {
+    let mut depth = 0usize;
+    let mut max = 0usize;
+    for c in source.chars() {
+        match c {
+            '{' | '[' => {
+                depth += 1;
+                max = max.max(depth);
+            }
+            '}' | ']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    max
+}
+
 /// Standard loader for BarkML files with enhanced capabilities
 ///
 /// This loader supports multiple methodologies for reading and combining BarkML files:
@@ -240,9 +260,35 @@ impl StandardLoader {
             None => e,
         };
 
-        let lexer = Token::lexer(&module_code);
-        let mut parser = Parser::new(name, lexer);
-        let module = parser.parse().map_err(wrap)?;
+        // Parsing is deeply recursive in nesting depth. Shallow documents
+        // (the common case) parse inline on the caller's thread; deeper ones
+        // get a dedicated large-stack thread so they fail with a typed
+        // RecursionLimit error instead of a stack overflow, without paying a
+        // thread spawn per parsed module. The raw-text delimiter scan only
+        // ever overestimates nesting (delimiters in strings/comments), never
+        // underestimates it, so the inline path stays safely shallow.
+        let module = if raw_nesting_depth(&module_code) < 12 {
+            let lexer = Token::lexer(&module_code);
+            let mut parser = Parser::new(name, lexer);
+            parser.parse()
+        } else {
+            let source_name = name.to_string();
+            std::thread::Builder::new()
+                .stack_size(16 * 1024 * 1024)
+                .spawn(move || {
+                    let lexer = Token::lexer(&module_code);
+                    let mut parser = Parser::new(&source_name, lexer);
+                    parser.parse()
+                })
+                .map_err(|e| error::Error::Io {
+                    reason: format!("Failed to spawn parse thread: {}", e),
+                })?
+                .join()
+                .map_err(|_| error::Error::Io {
+                    reason: "Parse thread panicked".to_string(),
+                })?
+        }
+        .map_err(wrap)?;
 
         // Update statistics
         self.stats.files_processed += 1;
@@ -392,14 +438,15 @@ impl StandardLoader {
         for path in &search_paths {
             let base_path = path.as_ref();
 
-            // Try .bml file first
-            let file_path = base_path.join(name).with_extension("bml");
+            // Try .bml file first (append rather than with_extension,
+            // which would mangle dotted module names like `app.conf`)
+            let file_path = base_path.join(format!("{name}.bml"));
             if file_path.exists() && file_path.is_file() {
                 return self.add_file(file_path);
             }
 
             // Try .d directory
-            let dir_path = base_path.join(name).with_extension("d");
+            let dir_path = base_path.join(format!("{name}.d"));
             if dir_path.exists() && dir_path.is_dir() {
                 return self.add_dir(dir_path);
             }

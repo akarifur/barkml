@@ -289,7 +289,18 @@ impl<'source> Walk<'source> {
                     })?;
                     Ok(Self::Statement(target))
                 } else if let Some(value) = stmt.get_value() {
-                    Ok(Self::Value(value))
+                    // An assignment's only addressable field is its own id;
+                    // any other name must fail, not silently resolve to the
+                    // assigned value.
+                    if field == stmt.identity().0 {
+                        Ok(Self::Value(value))
+                    } else {
+                        error::NoFieldSnafu {
+                            location: stmt.meta.location.clone(),
+                            field: field.to_string(),
+                        }
+                        .fail()
+                    }
                 } else {
                     error::NotScopeSnafu {
                         location: stmt.meta.location.clone(),

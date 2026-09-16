@@ -254,7 +254,7 @@ pub enum Token {
 
     #[regex(r"(#[ \t\f]*[^\n\r]+[\n\r])+", line_comment)]
     LineComment((Location, String)),
-    #[regex(r"\/\*[^\/\*]*\*\/", multiline_comment)]
+    #[regex(r"\/\*([^*]|\*+[^*/])*\*+\/", multiline_comment)]
     MultiLineComment((Location, String)),
 }
 
@@ -689,19 +689,29 @@ macro_rules! number {
             use snafu::ResultExt;
             pub fn integer(lexer: &mut logos::Lexer<$crate::syn::Token>) -> $crate::Result<($crate::ast::Location, super::Integer)> {
                 let location = $crate::syn::lexer::base_callback(lexer);
-                let slice = lexer.slice().replace('_', "");
-                let slice = slice.as_str();
-                let slice = slice.trim_start_matches("0x").trim_start_matches("0o").trim_start_matches("0b");
+                let raw = lexer.slice().replace('_', "");
+                // Split any sign first so radix prefixes are stripped from the
+                // magnitude (`-0xFF`), then re-attach it before parsing.
+                let (sign, body) = match raw.as_bytes().first() {
+                    Some(b'-') => ("-", &raw[1..]),
+                    Some(b'+') => ("", &raw[1..]),
+                    _ => ("", raw.as_str()),
+                };
+                let slice = body
+                    .trim_start_matches("0x")
+                    .trim_start_matches("0o")
+                    .trim_start_matches("0b");
+                let parse = format!("{}{}", sign, slice);
                 $(
                     if slice.ends_with($suffix) {
-                        let slice = slice.trim_end_matches($suffix);
-                        let value = $type::from_str_radix(slice, $radix).context($crate::error::IntegerSnafu {
+                        let slice = format!("{}{}", sign, slice.trim_end_matches($suffix));
+                        let value = $type::from_str_radix(&slice, $radix).context($crate::error::IntegerSnafu {
                             location: location.clone(),
                         })?;
                         return Ok((location.clone(), super::Integer::$wrap(value)));
                     }
                 )*
-                let value = i64::from_str_radix(slice, $radix).context($crate::error::IntegerSnafu {
+                let value = i64::from_str_radix(&parse, $radix).context($crate::error::IntegerSnafu {
                     location: location.clone(),
                 })?;
                 Ok((location.clone(), super::Integer::Signed(value)))
@@ -789,6 +799,48 @@ mod test {
             assert_eq!(bytes, b"hello");
         } else {
             panic!("Expected ByteString token");
+        }
+    }
+
+    #[test]
+    fn test_multiline_comment_with_slashes_and_stars() {
+        // Comment bodies containing `/` and `*` must lex as one comment
+        for input in [
+            "/* see docs/09 */",
+            "/* a ** b */",
+            "/* ** */",
+            "/* a/*b */",
+        ] {
+            let mut lexer = Token::lexer(input);
+            match lexer.next().unwrap().unwrap() {
+                Token::MultiLineComment((_, text)) => {
+                    assert_eq!(text.trim(), input[2..input.len() - 2].trim());
+                }
+                token => panic!("Expected MultiLineComment for {input:?}, got {token:?}"),
+            }
+            assert!(lexer.next().is_none());
+        }
+    }
+
+    #[test]
+    fn test_negative_radix_integers() {
+        for (input, radix, expected) in [
+            ("-0xFF", 16, -255i64),
+            ("+0o77", 8, 63),
+            ("-0b1010", 2, -10),
+            ("-0x10i32", 16, -16),
+        ] {
+            let mut lexer = Token::lexer(input);
+            match lexer.next().unwrap().unwrap() {
+                Token::Int((_, Integer::Signed(n))) => {
+                    assert_eq!(n, expected, "input {input} radix {radix}");
+                }
+                Token::Int((_, Integer::I32(n))) => {
+                    assert_eq!(i64::from(n), expected, "input {input} radix {radix}");
+                }
+                token => panic!("Expected integer for {input:?}, got {token:?}"),
+            }
+            assert!(lexer.next().is_none());
         }
     }
 
