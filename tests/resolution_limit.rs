@@ -512,17 +512,11 @@ fn parser_nesting_cap_is_independent_of_the_loader_limit() {
         .expect("probe thread");
     let err = result.expect_err("parser nesting must fail regardless of loader limit");
     match err {
-        // add_module maps parse failures through Io; the nested cause text
-        // identifies the parser-nesting limit and its fixed cap of 64
-        Error::Io { reason } => {
-            assert!(
-                reason.contains("parser nesting limit exceeded"),
-                "unexpected error: {reason}"
-            );
-            assert!(
-                reason.contains("maximum depth of 64"),
-                "unexpected error: {reason}"
-            );
+        // add_module forwards the typed parse failure; the nesting kind and
+        // its fixed cap of 64 identify the parser-nesting limit
+        Error::RecursionLimit { kind, limit, .. } => {
+            assert_eq!(kind, "parser nesting");
+            assert_eq!(limit, 64);
         }
         other => panic!("expected parser-nesting limit error, got: {other:?}"),
     }

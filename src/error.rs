@@ -97,6 +97,17 @@ pub enum Error {
     },
     #[snafu(display("type error: implicit conversion from '{left}' to '{right}' is not allowed"))]
     ImplicitConvert { left: ValueType, right: ValueType },
+    /// A typed parse/semantic error surfaced through file loading, with the
+    /// physical source path and logical module identity attached. The original
+    /// error is available via `source()` and the `source` field.
+    #[snafu(display("failed to load module '{module}' from '{}': {source}", path.display()))]
+    Load {
+        /// Physical path of the file being loaded
+        path: PathBuf,
+        /// Logical module identity the file was being loaded into
+        module: String,
+        source: Box<Error>,
+    },
     #[snafu(display("{location} - invalid integer: {source}"))]
     Integer {
         location: Location,

@@ -197,41 +197,52 @@ impl StandardLoader {
         Ok(())
     }
 
-    /// Parses a BarkML file with caching and error recovery
-    fn parse_file<R>(
-        &mut self,
-        name: &str,
-        code: &mut R,
-        filename: Option<String>,
-    ) -> Result<Statement>
+    /// Parses a BarkML source with caching and error preservation
+    ///
+    /// `name` is the logical module identity; `path` is the physical source
+    /// path when one exists (file loads). Typed parse/semantic errors are
+    /// wrapped in [`error::Error::Load`] when a physical path is known, and
+    /// forwarded untouched for in-memory sources. Genuine read failures
+    /// (including invalid UTF-8, which fails `read_to_string`) stay `Io`, as
+    /// does the documented empty-source policy.
+    fn parse_file<R>(&mut self, name: &str, code: &mut R, path: Option<&Path>) -> Result<Statement>
     where
         R: Read + Seek,
     {
         let start_time = Instant::now();
 
-        let filename = filename.unwrap_or_else(|| name.to_string());
+        let display_name = path
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| name.to_string());
         let mut module_code = String::new();
 
         code.read_to_string(&mut module_code)
             .map_err(|e| error::Error::Io {
-                reason: format!("Failed to read file '{}': {}", filename, e),
+                reason: format!("Failed to read file '{}': {}", display_name, e),
             })?;
 
         // Validate the content is not empty
         if module_code.trim().is_empty() {
             return Err(error::Error::Io {
-                reason: format!("File '{}' is empty or contains only whitespace", filename),
+                reason: format!(
+                    "File '{}' is empty or contains only whitespace",
+                    display_name
+                ),
             });
         }
 
+        let wrap = |e: error::Error| match path {
+            Some(p) => error::Error::Load {
+                path: p.to_path_buf(),
+                module: name.to_string(),
+                source: Box::new(e),
+            },
+            None => e,
+        };
+
         let lexer = Token::lexer(&module_code);
-        let mut parser = Parser::new(&filename, lexer);
-        let module = parser.parse().map_err(|e| {
-            // Enhance error with file context
-            error::Error::Io {
-                reason: format!("Failed to parse file '{}': {}", filename, e),
-            }
-        })?;
+        let mut parser = Parser::new(name, lexer);
+        let module = parser.parse().map_err(wrap)?;
 
         // Update statistics
         self.stats.files_processed += 1;
@@ -239,9 +250,7 @@ impl StandardLoader {
 
         // Validate if configured to do so
         if self.config.validate_on_load {
-            module.validate().map_err(|e| error::Error::Io {
-                reason: format!("Validation failed for file '{}': {}", filename, e),
-            })?;
+            module.validate().map_err(wrap)?;
         }
 
         Ok(module)
@@ -257,7 +266,10 @@ impl StandardLoader {
     where
         R: Read + Seek,
     {
-        let module = self.parse_file(name, code, filename)?;
+        // In-memory source: no filesystem path is invented; the optional
+        // filename keeps its role as the source name recorded in locations.
+        let source_name = filename.as_deref().unwrap_or(name);
+        let module = self.parse_file(source_name, code, None)?;
 
         self.merge_module_transactional(name, &module)?;
 
@@ -286,7 +298,7 @@ impl StandardLoader {
         })?;
 
         // Parse and cache the module
-        let module = self.parse_file(&name, &mut file, Some(name.clone()))?;
+        let module = self.parse_file(&name, &mut file, Some(path))?;
         self.file_cache.insert(path.to_path_buf(), module.clone());
 
         self.merge_module_transactional(&name, &module)?;
@@ -302,7 +314,7 @@ impl StandardLoader {
         let path = path.as_ref();
         utils::validate_path(path)?;
 
-        let name = utils::basename(path)?;
+        let _ = utils::basename(path)?; // retains Basename error behavior
 
         // Check cache first (merge is transactional either way)
         if let Some(cached_module) = self.file_cache.get(path).cloned() {
@@ -315,8 +327,9 @@ impl StandardLoader {
             reason: format!("Failed to open file '{}': {}", path.display(), e),
         })?;
 
-        // Parse and cache the module
-        let module = self.parse_file("main", &mut file, Some(name))?;
+        // Parse and cache the module; module identity is "main" but the
+        // physical path stays the file's own for diagnostics
+        let module = self.parse_file("main", &mut file, Some(path))?;
         self.file_cache.insert(path.to_path_buf(), module.clone());
 
         self.merge_module_transactional("main", &module)?;
@@ -735,10 +748,9 @@ mod tests {
                 .add_module("main", &mut Cursor::new(source.to_vec()), None)
                 .err()
                 .unwrap_or_else(|| panic!("duplicate must fail with allow_collisions={allow}"));
-            // parse_file wraps parser errors in Io; the duplicate diagnosis
-            // is still carried through the message
+            // the typed duplicate diagnosis is forwarded through loading
             assert!(
-                err.to_string().contains("duplicate declaration"),
+                matches!(err, error::Error::DuplicateDeclaration { .. }),
                 "got: {err}"
             );
         }
@@ -1000,5 +1012,253 @@ mod tests {
         assert_fully_identical(&before, loader.get_module("00-a").unwrap());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- structured error preservation regressions (docs/13) ----
+
+    use std::error::Error as StdError;
+
+    fn direct_parse(src: &str, module: &str) -> crate::Result<Statement> {
+        let mut parser = Parser::new(module, Token::lexer(src));
+        parser.parse()
+    }
+
+    /// Malformed fixtures: unexpected token, EOF inside an open block,
+    /// and a lexical failure.
+    const MALFORMED: &[&str] = &["x = 1 }\n", "a {\n", "@ = 1\n"];
+
+    fn temp_fixture(name: &str, content: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "barkml-err-{}-{:?}",
+            std::process::id(),
+            std::time::Instant::now()
+        ));
+        let file = dir.join(name);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, content).unwrap();
+        file
+    }
+
+    #[test]
+    fn loader_errors_match_direct_parse() {
+        for src in MALFORMED {
+            let direct = direct_parse(src, "main").expect_err("must fail to parse");
+            assert!(
+                !matches!(direct, error::Error::Io { .. }),
+                "fixture must be a parse error, got: {direct}"
+            );
+
+            // in-memory loading forwards the identical typed error
+            let mut loader = StandardLoader::default();
+            let err = loader
+                .add_module("main", &mut cursor(src), None)
+                .err()
+                .unwrap();
+            assert_eq!(err, direct, "add_module must forward the typed error");
+
+            // file loading wraps the identical typed error in Load
+            let file = temp_fixture("bad.bml", src);
+            let mut loader = StandardLoader::default();
+            let err = loader.import(&file).err().unwrap();
+            let direct_named = direct_parse(src, "bad").err().unwrap();
+            match &err {
+                error::Error::Load {
+                    path,
+                    module,
+                    source,
+                } => {
+                    assert_eq!(path, &file);
+                    assert_eq!(module, "bad");
+                    // same category/fields; only the module identity differs
+                    assert_eq!(source.as_ref(), &direct_named);
+                }
+                other => panic!("expected Load wrapper, got: {other}"),
+            }
+            // human-readable output still names path and inner error
+            assert!(err.to_string().contains(&file.display().to_string()));
+            assert!(err.to_string().contains(&direct_named.to_string()));
+            std::fs::remove_dir_all(file.parent().unwrap()).ok();
+        }
+    }
+
+    #[test]
+    fn load_wrapper_exposes_source_chain() {
+        let file = temp_fixture("chain.bml", "a {\n");
+        let mut loader = StandardLoader::default();
+        let err = loader.add_file(&file).err().unwrap();
+
+        let load = match &err {
+            error::Error::Load {
+                path,
+                module,
+                source,
+            } => {
+                assert_eq!(path, &file);
+                // merged into `main` but reports its own physical path
+                assert_eq!(module, "main");
+                source
+            }
+            other => panic!("expected Load wrapper, got: {other}"),
+        };
+        // std::error::Error::source() exposes the original typed error
+        // (typed access is the `source` field; `source()` hands the same
+        // error to `dyn Error` consumers)
+        assert_eq!(err.source().unwrap().to_string(), load.to_string());
+        // leaf syntax errors are not forced to fabricate a source
+        assert!(load.source().is_none());
+
+        std::fs::remove_dir_all(file.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn same_basename_in_different_dirs_is_distinguishable() {
+        let file_x = temp_fixture("conf/x/dup.bml", "a {\n");
+        let file_y = temp_fixture("conf/y/dup.bml", "a {\n");
+
+        let mut loader = StandardLoader::default();
+        let err_x = loader.import(&file_x).err().unwrap();
+        let err_y = loader.import(&file_y).err().unwrap();
+        let (
+            error::Error::Load {
+                path: px,
+                module: mx,
+                ..
+            },
+            error::Error::Load {
+                path: py,
+                module: my,
+                ..
+            },
+        ) = (&err_x, &err_y)
+        else {
+            panic!("expected Load wrappers, got: {err_x:?} / {err_y:?}")
+        };
+        assert_ne!(px, py);
+        assert_eq!(px, &file_x);
+        assert_eq!(py, &file_y);
+        // same logical module identity (same basename) is allowed to match
+        assert_eq!(mx, my);
+
+        std::fs::remove_dir_all(file_x.parent().unwrap().parent().unwrap()).ok();
+        std::fs::remove_dir_all(file_y.parent().unwrap().parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn multibyte_crlf_and_eof_locations_survive_loading() {
+        // multibyte UTF-8 before an error: column must count characters
+        let src = "name = \"日本語テキスト\"\n@ bad\n";
+        let direct = direct_parse(src, "main").err().unwrap();
+        let mut loader = StandardLoader::default();
+        let err = loader
+            .add_module("main", &mut cursor(src), None)
+            .err()
+            .unwrap();
+        assert_eq!(err, direct);
+        assert!(matches!(err, error::Error::Expected { .. }));
+
+        // CRLF input
+        let crlf = "a = 1\r\nb {\r\n";
+        let direct = direct_parse(crlf, "main").err().unwrap();
+        let mut loader = StandardLoader::default();
+        let err = loader
+            .add_module("main", &mut cursor(crlf), None)
+            .err()
+            .unwrap();
+        assert_eq!(err, direct);
+
+        // error at EOF after a trailing newline
+        let eof_src = "x = 1\ny {\n\n";
+        let direct = direct_parse(eof_src, "main").err().unwrap();
+        let mut loader = StandardLoader::default();
+        let err = loader
+            .add_module("main", &mut cursor(eof_src), None)
+            .err()
+            .unwrap();
+        assert_eq!(err, direct);
+    }
+
+    #[test]
+    fn non_ascii_source_filename_is_carried() {
+        let file = temp_fixture("設定.bml", "a {\n");
+        let mut loader = StandardLoader::default();
+        match loader.import(&file).err().unwrap() {
+            error::Error::Load { path, .. } => assert_eq!(path, file),
+            other => panic!("expected Load wrapper, got: {other}"),
+        }
+        std::fs::remove_dir_all(file.parent().unwrap()).ok();
+    }
+
+    /// Deterministic injected `Read + Seek` failure (not permission-based).
+    struct FailingRead;
+    impl Read for FailingRead {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("injected disk failure"))
+        }
+    }
+    impl Seek for FailingRead {
+        fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn injected_read_failure_stays_io() {
+        let mut loader = StandardLoader::default();
+        let err = loader
+            .add_module("main", &mut FailingRead, None)
+            .err()
+            .unwrap();
+        match &err {
+            error::Error::Io { reason } => {
+                assert!(reason.contains("injected disk failure"), "got: {reason}")
+            }
+            other => panic!("genuine read failure must stay Io, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_is_a_read_failure_not_a_syntax_error() {
+        let mut loader = StandardLoader::default();
+        let err = loader
+            .add_module(
+                "main",
+                &mut Cursor::new(vec![0xff, 0xfe, b' ', b'=', b' ']),
+                None,
+            )
+            .err()
+            .unwrap();
+        match &err {
+            error::Error::Io { reason } => {
+                assert!(reason.to_lowercase().contains("utf-8"), "got: {reason}")
+            }
+            other => panic!("invalid UTF-8 must be a read failure, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn validation_on_load_keeps_semantic_error() {
+        let mut loader = StandardLoader::builder().validate_on_load(true).build();
+        let err = loader
+            .add_module("main", &mut cursor("x: i32 = \"str\"\n"), None)
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, error::Error::Assign { .. }),
+            "semantic validation failure must stay semantic, got: {err}"
+        );
+    }
+
+    #[test]
+    fn failed_parse_publishes_nothing() {
+        let file = temp_fixture("unpublished.bml", "a {\n");
+        let mut loader = StandardLoader::default();
+        assert!(loader.import(&file).is_err());
+        assert_eq!(loader.cache_size(), 0);
+        assert!(!loader.has_module("unpublished"));
+        assert_eq!(loader.module_names().len(), 0);
+
+        assert!(loader.add_file(&file).is_err());
+        assert!(!loader.has_module("main"));
+        std::fs::remove_dir_all(file.parent().unwrap()).ok();
     }
 }
