@@ -38,6 +38,18 @@ pub trait Loader {
     /// `true` if macro resolution is enabled, `false` otherwise
     fn is_resolution_enabled(&self) -> bool;
 
+    /// Returns the maximum expansion depth for reference resolution.
+    ///
+    /// This guard bounds long acyclic dependency chains; reference cycles
+    /// are detected structurally and are not affected by the limit.
+    ///
+    /// # Returns
+    ///
+    /// The configured limit, defaulting to 100
+    fn max_recursion_depth(&self) -> usize {
+        100
+    }
+
     /// Disables macro resolution for this loader
     ///
     /// When disabled, macros in the loaded content will remain as-is,
@@ -74,7 +86,7 @@ pub trait Loader {
     fn load(&self) -> Result<Statement> {
         let mut module = self.read()?;
         if self.is_resolution_enabled() {
-            let mut scope = Scope::new(&module);
+            let mut scope = Scope::with_limit(&module, self.max_recursion_depth());
             module = scope.apply()?;
         }
         Ok(module)
@@ -95,7 +107,7 @@ pub trait Loader {
 
         // If macro resolution is enabled, validate that all macros can be resolved
         if self.is_resolution_enabled() {
-            let scope = Scope::new(&module);
+            let scope = Scope::with_limit(&module, self.max_recursion_depth());
             scope.validate_references()?;
         }
 

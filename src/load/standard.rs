@@ -403,6 +403,10 @@ impl Loader for StandardLoader {
         self.config.resolve_macros
     }
 
+    fn max_recursion_depth(&self) -> usize {
+        self.config.max_recursion_depth
+    }
+
     fn skip_macro_resolution(&mut self) -> Result<&mut Self> {
         self.config.resolve_macros = false;
         Ok(self)

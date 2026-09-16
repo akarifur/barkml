@@ -26,7 +26,7 @@ impl ValueSerializer {
     }
 }
 
-impl<'a> Serializer for &'a mut ValueSerializer {
+impl Serializer for &mut ValueSerializer {
     type Ok = Value;
     type Error = Error;
 

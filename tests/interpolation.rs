@@ -1,7 +1,7 @@
 //! End-to-end tests for explicit string interpolation and the coherent
 //! string model (docs/04).
 
-use barkml::from_str;
+use barkml::{Error, from_str};
 
 fn resolve(input: &str) -> barkml::Statement {
     from_str(input).expect("parse and resolve")
@@ -282,10 +282,13 @@ fn placeholder_cycles_fail() {
         }",
     )
     .unwrap_err();
-    assert!(
-        format!("{err}").contains("loop") || format!("{err}").contains("recursion"),
-        "unexpected error: {err}"
-    );
+    match err {
+        Error::Cycle { target, trace, .. } => {
+            assert_eq!(target, "vars.a");
+            assert_eq!(trace, vec!["vars.a", "vars.b", "vars.a"]);
+        }
+        other => panic!("expected cycle error, got: {other}"),
+    }
 }
 
 #[test]

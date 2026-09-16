@@ -65,10 +65,10 @@ mod tests {
     pub fn find_values_by_type(stmt: &Statement, target_type: &ValueType) -> Vec<Value> {
         let mut results = Vec::new();
 
-        if let Some(value) = stmt.get_value() {
-            if std::mem::discriminant(&value.type_of()) == std::mem::discriminant(target_type) {
-                results.push(value.clone());
-            }
+        if let Some(value) = stmt.get_value()
+            && std::mem::discriminant(&value.type_of()) == std::mem::discriminant(target_type)
+        {
+            results.push(value.clone());
         }
 
         for child in stmt.children() {

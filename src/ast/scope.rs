@@ -1,14 +1,16 @@
-use super::types::{StatementType, ValueType};
+use super::types::{Location, StatementType, ValueType};
 use super::{Data, Statement, StatementData, TemplatePart, Value};
 use crate::{Result, error};
-use indexmap::{IndexMap, IndexSet};
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use snafu::ensure;
+use std::collections::HashMap;
 use std::fmt;
 use uuid::Uuid;
 
-/// Maximum recursion depth for macro resolution to prevent infinite loops
-const MAX_RECURSION_DEPTH: usize = 100;
+/// Default maximum expansion depth for reference resolution when no
+/// explicit limit is configured; guards long acyclic dependency chains.
+const DEFAULT_RECURSION_LIMIT: usize = 100;
 
 /// A single component of a structured symbol-table path or reference.
 ///
@@ -132,8 +134,78 @@ pub struct Scope {
     /// Maps value UIDs to their structured paths for efficient lookup
     path_lookup: IndexMap<Uuid, Vec<Segment>>,
 
-    /// Current recursion depth for macro resolution
-    recursion_depth: usize,
+    /// Maximum expansion depth for reference resolution; guards long
+    /// acyclic dependency chains separately from cycle detection
+    recursion_limit: usize,
+}
+
+/// Traversal state for cycle-aware resolution.
+///
+/// Every dependency node is unseen, active on the current traversal stack,
+/// or successfully resolved. Dependency identity is the target's canonical
+/// symbol-table path: an edge back to an active node is a cycle, while an
+/// edge to a resolved node is valid reuse. Only successful results are
+/// cached, and active state is unwound on every error path.
+struct Traversal {
+    /// Active dependency nodes in visit order; the position of each node's
+    /// first occurrence in a cycle is recovered from `index`
+    stack: Vec<Frame>,
+    /// Path -> position on the active stack
+    index: HashMap<Vec<Segment>, usize>,
+    /// Successfully resolved nodes keyed by canonical path
+    resolved: IndexMap<Vec<Segment>, Value>,
+}
+
+/// One active dependency node and the reference edge that led to it.
+struct Frame {
+    path: Vec<Segment>,
+    edge: Location,
+}
+
+impl Traversal {
+    fn new() -> Self {
+        Self {
+            stack: Vec::new(),
+            index: HashMap::new(),
+            resolved: IndexMap::new(),
+        }
+    }
+
+    /// Position of `path` on the active stack, if it is currently active.
+    fn active_position(&self, path: &[Segment]) -> Option<usize> {
+        self.index.get(path).copied()
+    }
+
+    /// Marks `path` active before descending into its dependencies.
+    /// Returns the stack mark to unwind/settle to.
+    fn push(&mut self, path: &[Segment], edge: Location) -> usize {
+        let mark = self.stack.len();
+        self.index.insert(path.to_vec(), mark);
+        self.stack.push(Frame {
+            path: path.to_vec(),
+            edge,
+        });
+        mark
+    }
+
+    /// Unwinds to `mark` after a failed expansion. Nothing is cached, so
+    /// a retry starts from clean state.
+    fn unwind(&mut self, mark: usize) {
+        while self.stack.len() > mark {
+            if let Some(frame) = self.stack.pop() {
+                self.index.remove(&frame.path);
+            }
+        }
+    }
+
+    /// Pops the frame pushed at `mark` after a successful expansion and
+    /// caches the resolved value for valid reuse by later references.
+    fn settle(&mut self, mark: usize, value: Value) {
+        let frame = self.stack.pop().expect("settle mark must be on the stack");
+        debug_assert_eq!(self.stack.len(), mark);
+        self.index.remove(&frame.path);
+        self.resolved.insert(frame.path, value);
+    }
 }
 
 /// Whether a type contains a reference anywhere (including inside arrays
@@ -148,13 +220,21 @@ fn contains_reference_impl(value_type: &ValueType) -> bool {
 }
 
 impl Scope {
-    /// Creates a new Scope from a root statement
+    /// Creates a new Scope from a root statement with the default
+    /// expansion-depth limit.
     pub fn new(node: &Statement) -> Self {
+        Self::with_limit(node, DEFAULT_RECURSION_LIMIT)
+    }
+
+    /// Creates a new Scope with an explicit expansion-depth limit. The
+    /// limit guards long acyclic dependency chains; cycles are detected by
+    /// active back-edges regardless of the limit.
+    pub fn with_limit(node: &Statement, limit: usize) -> Self {
         let mut scope = Self {
             root: node.clone(),
             symbol_table: IndexMap::new(),
             path_lookup: IndexMap::new(),
-            recursion_depth: 0,
+            recursion_limit: limit,
         };
         Self::build_symbol_table(&mut scope, node, Vec::new());
         scope
@@ -216,11 +296,12 @@ impl Scope {
         scope.path_lookup.insert(node.uid, path);
     }
 
-    /// Finds symbol table entries whose path (excluding the root segment)
-    /// is addressable by the given reference segments. Selector kinds are
-    /// enforced: `Key` addresses identifiers and labels, `Index` addresses
-    /// array elements only. Multiple matches indicate an ambiguous selector.
-    fn reference_matches(&self, segments: &[Segment]) -> Vec<&Value> {
+    /// Finds the symbol-table entries whose path (excluding the root
+    /// segment) is addressable by the given reference segments, with both
+    /// path and value. Selector kinds are enforced: `Key` addresses
+    /// identifiers and labels, `Index` addresses array elements only.
+    /// Multiple matches indicate an ambiguous selector.
+    fn reference_matches(&self, segments: &[Segment]) -> Vec<(&Vec<Segment>, &Value)> {
         self.symbol_table
             .iter()
             .filter(|(path, _)| {
@@ -230,16 +311,16 @@ impl Scope {
                         .zip(segments)
                         .all(|(segment, selector)| segment.accepts(selector))
             })
-            .map(|(_, value)| value)
             .collect()
     }
 
-    /// Applies reference resolution to the entire scope
+    /// Applies reference resolution to the entire scope. Each `apply` call
+    /// starts from fresh traversal state, so repeated and retried calls
+    /// never observe stale active-state cycles.
     pub fn apply(&mut self) -> Result<Statement> {
-        let mut visit_log = IndexSet::new();
         let root = self.root.clone();
-        self.recursion_depth = 0;
-        self.resolve_statement(&root, &mut visit_log)
+        let mut traversal = Traversal::new();
+        self.resolve_statement(&root, Vec::new(), &mut traversal)
     }
 
     /// Resolves a structured reference to its actual value, preserving the
@@ -249,75 +330,113 @@ impl Scope {
         &mut self,
         at: &Value,
         segments: &[Segment],
-        visit_log: &mut IndexSet<Uuid>,
+        traversal: &mut Traversal,
     ) -> Result<Value> {
-        // Check recursion depth
-        ensure!(
-            self.recursion_depth < MAX_RECURSION_DEPTH,
-            error::RecursionLimitSnafu {
-                location: at.meta.location.clone(),
-                limit: MAX_RECURSION_DEPTH,
-            }
-        );
-
-        self.recursion_depth += 1;
-        let mut chain_log = IndexSet::new();
-        let result = self.resolve_reference_internal(at, segments, visit_log, &mut chain_log);
-        self.recursion_depth -= 1;
-        result
-    }
-
-    fn resolve_reference_internal(
-        &mut self,
-        at: &Value,
-        segments: &[Segment],
-        visit_log: &mut IndexSet<Uuid>,
-        chain_log: &mut IndexSet<String>,
-    ) -> Result<Value> {
-        // Detect reference cycles across chained hops
-        let display = Segment::display_path(segments);
-        ensure!(
-            chain_log.insert(display),
-            error::LoopSnafu {
-                location: at.meta.location.clone()
-            }
-        );
-
-        let targets: Vec<&Value> = self.reference_matches(segments);
-        if targets.len() > 1 {
+        let matches = self.reference_matches(segments);
+        if matches.len() > 1 {
             return error::WrongSelectorSnafu {
                 location: at.meta.location.clone(),
                 path: Segment::display_path(segments),
-                reason: format!("selector matches {} distinct declarations", targets.len()),
+                reason: format!("selector matches {} distinct declarations", matches.len()),
             }
             .fail();
         }
 
-        if let Some(target) = targets.first() {
-            let resolved_value = Value {
-                uid: at.uid,
-                data: target.data.clone(),
-                meta: at.meta.clone(),
-            };
-
-            // If the resolved value is itself a reference, resolve it recursively
-            if let Data::Reference(chained) = &resolved_value.data {
-                return self.resolve_reference_internal(at, chained, visit_log, chain_log);
-            }
-
-            // Composite targets may themselves contain references; resolve
-            // them so no dangling references escape resolution. The copy is
-            // resolved with a fresh visit log since cloned children retain
-            // the target's UIDs; depth and chain guards still bound cycles.
-            if resolved_value.data.is_collection() {
-                let mut fresh_log = IndexSet::new();
-                return self.resolve_value(&resolved_value, &mut fresh_log);
-            }
-
-            return Ok(resolved_value);
+        let found = matches
+            .into_iter()
+            .next()
+            .map(|(path, value)| (path.clone(), value.clone()));
+        match found {
+            Some((path, target)) => self.resolve_entry(at, &path, &target, traversal),
+            None => self.reference_failure(at, segments),
         }
+    }
 
-        self.reference_failure(at, segments)
+    /// Resolves the symbol-table entry at `path`, with `at` as the
+    /// referring site (its UID and metadata are preserved on the result).
+    ///
+    /// Cycle, reuse, and depth are decided here, in that order: a back-edge
+    /// to an active node is a cycle even at the depth limit; an edge to a
+    /// resolved node reuses the cached result rebuilt with the caller's
+    /// identity; only otherwise is another expansion charged against the
+    /// limit.
+    fn resolve_entry(
+        &mut self,
+        at: &Value,
+        path: &[Segment],
+        target: &Value,
+        traversal: &mut Traversal,
+    ) -> Result<Value> {
+        if let Some(start) = traversal.active_position(path) {
+            return self.cycle_error(at, traversal, start, path);
+        }
+        if let Some(cached) = traversal.resolved.get(path) {
+            return Ok(Value {
+                uid: at.uid,
+                data: cached.data.clone(),
+                meta: at.meta.clone(),
+            });
+        }
+        ensure!(
+            traversal.stack.len() < self.recursion_limit,
+            error::RecursionLimitSnafu {
+                location: at.meta.location.clone(),
+                limit: self.recursion_limit,
+            }
+        );
+
+        let mark = traversal.push(path, at.meta.location.clone());
+        let result = self.resolve_value(target, traversal);
+        match result {
+            Ok(resolved) => {
+                traversal.settle(mark, resolved.clone());
+                Ok(Value {
+                    uid: at.uid,
+                    data: resolved.data,
+                    meta: at.meta.clone(),
+                })
+            }
+            Err(err) => {
+                traversal.unwind(mark);
+                Err(err)
+            }
+        }
+    }
+
+    /// Builds the structured cycle error for a back-edge to the active
+    /// node at stack position `start`: the closed trace in traversal order
+    /// plus the source location of every edge forming the cycle.
+    /// `edge_locations[i]` is the site of the reference edge
+    /// `trace[i] -> trace[i + 1]`, so its length is `trace.len() - 1`.
+    fn cycle_error(
+        &self,
+        at: &Value,
+        traversal: &Traversal,
+        start: usize,
+        path: &[Segment],
+    ) -> Result<Value> {
+        let target = Segment::display_path(&path[1..]);
+        let mut trace = Vec::with_capacity(traversal.stack.len() - start + 1);
+        for frame in &traversal.stack[start..] {
+            trace.push(Segment::display_path(&frame.path[1..]));
+        }
+        trace.push(target.clone());
+        // The first frame's edge entered the cycle from outside; the
+        // cycle's own edges are the ones that led between cycle nodes,
+        // closing with the back-edge at the referring site
+        let mut edge_locations = traversal.stack[start + 1..]
+            .iter()
+            .map(|frame| frame.edge.clone())
+            .collect::<Vec<_>>();
+        edge_locations.push(at.meta.location.clone());
+
+        error::CycleSnafu {
+            location: at.meta.location.clone(),
+            target,
+            trace,
+            edge_locations,
+        }
+        .fail()
     }
 
     /// Produces a diagnostic for an unresolvable reference: distinguishes
@@ -343,38 +462,39 @@ impl Scope {
             }
         }
 
-        if let Some((matched, value)) = deepest {
-            if 0 < matched && matched < segments.len() {
-                let next = &segments[matched];
-                match (&value.data, next) {
-                    (Data::Array(contents), Segment::Index(index)) if *index >= contents.len() => {
-                        return error::NoElementSnafu {
-                            location,
-                            index: *index,
-                        }
-                        .fail();
+        if let Some((matched, value)) = deepest
+            && 0 < matched
+            && matched < segments.len()
+        {
+            let next = &segments[matched];
+            match (&value.data, next) {
+                (Data::Array(contents), Segment::Index(index)) if *index >= contents.len() => {
+                    return error::NoElementSnafu {
+                        location,
+                        index: *index,
                     }
-                    (Data::Array(_), Segment::Key(key)) => {
-                        return error::WrongSelectorSnafu {
-                            location,
-                            path: display,
-                            reason: format!(
-                                "quoted selector \"{}\" cannot address an array element; use a numeric index like items[0]",
-                                key
-                            ),
-                        }
-                        .fail();
-                    }
-                    (_, Segment::Index(index)) => {
-                        return error::WrongSelectorSnafu {
-                            location,
-                            path: display,
-                            reason: format!("numeric index [{}] used where no array exists", index),
-                        }
-                        .fail();
-                    }
-                    _ => {}
+                    .fail();
                 }
+                (Data::Array(_), Segment::Key(key)) => {
+                    return error::WrongSelectorSnafu {
+                        location,
+                        path: display,
+                        reason: format!(
+                            "quoted selector \"{}\" cannot address an array element; use a numeric index like items[0]",
+                            key
+                        ),
+                    }
+                    .fail();
+                }
+                (_, Segment::Index(index)) => {
+                    return error::WrongSelectorSnafu {
+                        location,
+                        path: display,
+                        reason: format!("numeric index [{}] used where no array exists", index),
+                    }
+                    .fail();
+                }
+                _ => {}
             }
         }
 
@@ -406,30 +526,36 @@ impl Scope {
         misses
     }
 
-    /// Resolves all macros in a statement
+    /// Resolves all references in a statement. `path` mirrors the symbol
+    /// table construction so each value entry is resolved at its canonical
+    /// path (node-granular cycle and reuse identity).
     fn resolve_statement(
         &mut self,
         at: &Statement,
-        visit_log: &mut IndexSet<Uuid>,
+        path: Vec<Segment>,
+        traversal: &mut Traversal,
     ) -> Result<Statement> {
-        let uid = at.uid;
-
-        // Check for circular references
-        ensure!(
-            !visit_log.contains(&uid),
-            error::LoopSnafu {
-                location: at.meta.location.clone()
+        let mut node_path = path;
+        node_path.push(Segment::Id(at.id.clone()));
+        if let StatementData::Labeled(labels, _) = &at.data {
+            for label in labels {
+                if let Some(text) = label.as_string() {
+                    node_path.push(Segment::Label(text.clone()));
+                }
             }
-        );
+        }
 
-        let result = match &at.type_ {
+        match &at.type_ {
             StatementType::Module(_) => {
                 let mut new_children = IndexMap::new();
                 for (key, value) in at.get_grouped().unwrap() {
-                    new_children.insert(key.clone(), self.resolve_statement(value, visit_log)?);
+                    new_children.insert(
+                        key.clone(),
+                        self.resolve_statement(value, node_path.clone(), traversal)?,
+                    );
                 }
 
-                Statement::new_module(&at.id, new_children, at.meta.clone())
+                Ok(Statement::new_module(&at.id, new_children, at.meta.clone()))
             }
             StatementType::Block { .. } => {
                 let mut new_children = IndexMap::new();
@@ -437,21 +563,30 @@ impl Scope {
                 let (labels, children) = at.get_labeled().unwrap();
 
                 for label in labels {
-                    new_labels.push(self.resolve_value(label, visit_log)?);
+                    new_labels.push(self.resolve_value(label, traversal)?);
                 }
 
                 for (key, value) in children.iter() {
-                    new_children.insert(key.clone(), self.resolve_statement(value, visit_log)?);
+                    new_children.insert(
+                        key.clone(),
+                        self.resolve_statement(value, node_path.clone(), traversal)?,
+                    );
                 }
 
-                Statement::new_block(&at.id, new_labels, new_children, at.meta.clone())
+                Ok(Statement::new_block(
+                    &at.id,
+                    new_labels,
+                    new_children,
+                    at.meta.clone(),
+                ))
             }
             StatementType::Assignment(expected) => {
                 // Adopt the resolved target type only when the stored type was
                 // derived from the parsed value (i.e. contains a reference);
                 // declared types stay enforced against the resolved value
                 let adopts_target = contains_reference_impl(expected);
-                let new_value = self.resolve_value(at.get_value().unwrap(), visit_log)?;
+                let value = at.get_value().unwrap();
+                let new_value = self.resolve_entry(value, &node_path, value, traversal)?;
                 let expected = if adopts_target {
                     new_value.type_of()
                 } else {
@@ -466,52 +601,31 @@ impl Scope {
                     }
                 );
 
-                Statement::new_assign(&at.id, Some(expected.clone()), new_value, at.meta.clone())?
+                Statement::new_assign(&at.id, Some(expected.clone()), new_value, at.meta.clone())
             }
-        };
-
-        visit_log.insert(uid);
-        Ok(result)
+        }
     }
 
     /// Resolves an interpolated string: each placeholder is resolved with
-    /// the same reference machinery (cycle, depth, and missing-target
-    /// semantics) and rendered under the scalar-only interpolation policy.
-    /// Targets that are themselves templates resolve recursively; the
-    /// recursion depth guard bounds placeholder cycles.
+    /// the same traversal state (cycle, reuse, depth, and missing-target
+    /// semantics) as ordinary references and rendered under the scalar-only
+    /// interpolation policy.
     fn resolve_template(
         &mut self,
         at: &Value,
         parts: &[TemplatePart],
-        visit_log: &mut IndexSet<Uuid>,
+        traversal: &mut Traversal,
     ) -> Result<Value> {
-        ensure!(
-            self.recursion_depth < MAX_RECURSION_DEPTH,
-            error::RecursionLimitSnafu {
-                location: at.meta.location.clone(),
-                limit: MAX_RECURSION_DEPTH,
-            }
-        );
-        self.recursion_depth += 1;
-
         let mut out = String::new();
         for part in parts {
             match part {
                 TemplatePart::Literal(text) => out.push_str(text),
                 TemplatePart::Placeholder(segments, location) => {
-                    let resolved = self.resolve_reference(at, segments, visit_log)?;
-                    // Placeholder targets carry the template's own UID after
-                    // resolution, so the generic resolve_value visit-log check
-                    // would misfire; nested templates recurse here instead.
-                    let rendered = match resolved.data {
-                        Data::Template(nested) => self.resolve_template(at, &nested, visit_log)?,
-                        _ => resolved,
-                    };
-                    out.push_str(&rendered.render_scalar(location)?);
+                    let resolved = self.resolve_reference(at, segments, traversal)?;
+                    out.push_str(&resolved.render_scalar(location)?);
                 }
             }
         }
-        self.recursion_depth -= 1;
 
         Ok(Value {
             uid: at.uid,
@@ -520,48 +634,39 @@ impl Scope {
         })
     }
 
-    /// Resolves all references in a value
-    fn resolve_value(&mut self, at: &Value, visit_log: &mut IndexSet<Uuid>) -> Result<Value> {
-        let uid = at.uid;
-
-        // Check for circular references
-        ensure!(
-            !visit_log.contains(&uid),
-            error::LoopSnafu {
-                location: at.meta.location.clone()
-            }
-        );
-
-        let result = match &at.data {
-            Data::Reference(segments) => self.resolve_reference(at, segments, visit_log)?,
-            Data::Template(parts) => self.resolve_template(at, parts, visit_log)?,
+    /// Resolves all references in a value. Dependency nodes are entered via
+    /// `resolve_entry`; container children are part of their parent entry's
+    /// expansion, so cycles and reuse are tracked at node granularity.
+    fn resolve_value(&mut self, at: &Value, traversal: &mut Traversal) -> Result<Value> {
+        match &at.data {
+            Data::Reference(segments) => self.resolve_reference(at, segments, traversal),
+            Data::Template(parts) => self.resolve_template(at, parts, traversal),
             Data::Table(children) => {
+                let uid = at.uid;
                 let mut new_children = IndexMap::new();
                 for (key, value) in children.iter() {
-                    new_children.insert(key.clone(), self.resolve_value(value, visit_log)?);
+                    new_children.insert(key.clone(), self.resolve_value(value, traversal)?);
                 }
-                Value {
+                Ok(Value {
                     uid,
                     data: Data::Table(new_children),
                     meta: at.meta.clone(),
-                }
+                })
             }
             Data::Array(children) => {
+                let uid = at.uid;
                 let mut new_children = Vec::new();
                 for value in children.iter() {
-                    new_children.push(self.resolve_value(value, visit_log)?);
+                    new_children.push(self.resolve_value(value, traversal)?);
                 }
-                Value {
+                Ok(Value {
                     uid,
                     data: Data::Array(new_children),
                     meta: at.meta.clone(),
-                }
+                })
             }
-            _ => at.clone(),
-        };
-
-        visit_log.insert(uid);
-        Ok(result)
+            _ => Ok(at.clone()),
+        }
     }
 
     /// Returns a reference to the symbol table
@@ -577,7 +682,9 @@ impl Scope {
     /// Looks up a value by structured reference segments (root-relative),
     /// applying the same selector-kind rules as reference resolution.
     pub fn lookup(&self, segments: &[Segment]) -> Option<&Value> {
-        self.reference_matches(segments).first().copied()
+        self.reference_matches(segments)
+            .first()
+            .map(|(_, value)| *value)
     }
 
     /// Looks up a value by its full structured symbol-table path (including
@@ -597,36 +704,17 @@ impl Scope {
             .collect()
     }
 
-    /// Validates that all references can be resolved
+    /// Validates that all references can be resolved without cycles by
+    /// running the same traversal as `apply` and discarding the resolved
+    /// output, so validation and evaluation cannot disagree.
     pub fn validate_references(&self) -> Result<()> {
-        let references: Vec<Value> = self
-            .symbol_table
-            .values()
-            .filter(|value| matches!(value.data, Data::Reference(_) | Data::Template(_)))
-            .cloned()
-            .collect();
-
         let mut scope = Self {
             root: self.root.clone(),
             symbol_table: self.symbol_table.clone(),
             path_lookup: IndexMap::new(),
-            recursion_depth: 0,
+            recursion_limit: self.recursion_limit,
         };
-
-        for value in references {
-            match &value.data {
-                Data::Reference(segments) => {
-                    let mut visit_log = IndexSet::new();
-                    scope.resolve_reference(&value, segments, &mut visit_log)?;
-                }
-                Data::Template(_) => {
-                    let mut visit_log = IndexSet::new();
-                    scope.resolve_value(&value, &mut visit_log)?;
-                }
-                _ => {}
-            }
-        }
-        Ok(())
+        scope.apply().map(|_| ())
     }
 }
 

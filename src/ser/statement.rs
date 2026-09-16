@@ -28,7 +28,7 @@ impl StatementSerializer {
     }
 }
 
-impl<'a> Serializer for &'a mut StatementSerializer {
+impl Serializer for &mut StatementSerializer {
     type Ok = Statement;
     type Error = Error;
 

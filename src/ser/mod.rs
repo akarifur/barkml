@@ -73,6 +73,7 @@ mod tests {
     use crate::de::from_value;
 
     #[derive(Debug, PartialEq, Deserialize, Serialize)]
+    #[allow(dead_code)] // fields exercised via (de)serialization, not by name
     struct TestConfig {
         version: String,
         debug: bool,

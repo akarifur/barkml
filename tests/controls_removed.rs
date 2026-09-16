@@ -125,6 +125,7 @@ fn schema_as_reference_path_component() {
 }
 
 #[test]
+#[allow(clippy::approx_constant)] // 3.14 is test input data
 fn labels_and_type_hints_still_work() {
     let module = resolve(
         "meta {

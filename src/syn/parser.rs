@@ -323,11 +323,11 @@ impl<'source> Parser<'source> {
         }
 
         // If we didn't find a label in the comment processing loop, check again
-        if meta.label.is_none() {
-            if let Some(Token::LabelIdentifier((_, label))) = self.tokens.peek()? {
-                self.tokens.discard();
-                meta.label = Some(label.clone());
-            }
+        if meta.label.is_none()
+            && let Some(Token::LabelIdentifier((_, label))) = self.tokens.peek()?
+        {
+            self.tokens.discard();
+            meta.label = Some(label.clone());
         }
 
         Ok(meta)

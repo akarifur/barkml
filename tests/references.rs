@@ -1,6 +1,6 @@
 //! End-to-end tests for reference expressions (docs/03).
 
-use barkml::{Segment, from_str};
+use barkml::{Error, Segment, from_str};
 
 fn resolve(input: &str) -> barkml::Statement {
     from_str(input).expect("parse and resolve")
@@ -443,8 +443,13 @@ fn reference_cycles_fail() {
         }",
     )
     .unwrap_err();
-    let message = format!("{err}");
-    assert!(message.contains("loop"), "unexpected error: {message}");
+    match err {
+        Error::Cycle { target, trace, .. } => {
+            assert_eq!(target, "a.value");
+            assert_eq!(trace, vec!["a.value", "b.value", "a.value"]);
+        }
+        other => panic!("expected cycle error, got: {other}"),
+    }
 }
 
 #[test]

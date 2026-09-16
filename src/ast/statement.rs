@@ -406,19 +406,15 @@ impl Statement {
     /// Validates the statement structure recursively
     pub fn validate(&self) -> Result<()> {
         // Validate this statement
-        match &self.type_ {
-            StatementType::Assignment(expected) => {
-                if let Some(value) = self.get_value() {
-                    if !expected.can_assign(&value.type_of()) {
-                        return error::ImplicitConvertSnafu {
-                            left: expected.clone(),
-                            right: value.type_of(),
-                        }
-                        .fail();
-                    }
-                }
+        if let StatementType::Assignment(expected) = &self.type_
+            && let Some(value) = self.get_value()
+            && !expected.can_assign(&value.type_of())
+        {
+            return error::ImplicitConvertSnafu {
+                left: expected.clone(),
+                right: value.type_of(),
             }
-            _ => {}
+            .fail();
         }
 
         // Recursively validate children

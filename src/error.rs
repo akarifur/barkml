@@ -141,8 +141,25 @@ pub enum Error {
     RecursionLimit { location: Location, limit: usize },
     #[snafu(display("{location} - invalid semantic version requirement: {reason}"))]
     Require { location: Location, reason: String },
-    #[snafu(display("{location} - infinite loop detected during reference resolution"))]
-    Loop { location: Location },
+    #[snafu(display(
+        "{location} - reference cycle detected: {}; dependency edges at: {}",
+        trace.join(" -> "),
+        edge_locations
+            .iter()
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))]
+    Cycle {
+        location: Location,
+        /// Display form of the repeated dependency target
+        target: String,
+        /// Closed cycle trace in traversal order, starting and ending at the target
+        trace: Vec<String>,
+        /// Source locations of the reference edges forming the cycle:
+        /// `edge_locations[i]` is the site of edge `trace[i] -> trace[i + 1]`
+        edge_locations: Vec<Location>,
+    },
     #[snafu(display("module not found: could not find file named {name}.bml or directory named {name}.d in any of these paths:\n{}", search_paths.iter().map(|x| x.to_string_lossy().to_string()).collect::<Vec<_>>().join("\n")))]
     Search {
         name: String,
