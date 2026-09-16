@@ -1,7 +1,7 @@
 //! End-to-end tests for dependency-cycle detection with structured traces
 //! (docs/10).
 
-use barkml::{Error, Loader, Scope, StandardLoader, Statement, from_str};
+use barkml::{DEFAULT_RECURSION_LIMIT, Error, Loader, Scope, StandardLoader, Statement, from_str};
 use std::io::Cursor;
 
 fn resolve(input: &str) -> Statement {
@@ -242,18 +242,24 @@ fn long_acyclic_chain_hits_the_configured_limit_not_a_cycle() {
 }
 
 #[test]
-fn ordered_acyclic_chain_stays_shallow_through_reuse() {
+fn ordered_acyclic_chain_matches_head_first_outcome() {
     // Leaf-first declaration lets each statement reuse the cached result of
-    // the previous one; a 200-link chain resolves without hitting the limit
+    // the previous one, but cached reuse retains dependency height (docs/11):
+    // a 200-link chain must hit the limit identically to the head-first
+    // order, and resolve when the limit is raised
     let mut input = String::from("a0 = \"leaf\"\n");
     for i in 1..200 {
         input.push_str(&format!("a{i} = a{}\n", i - 1));
     }
-    let module = from_str(&input).expect("ordered chain resolves");
-    assert_eq!(
-        value_of(&module, "a199").as_string(),
-        Some(&"leaf".to_string())
-    );
+    let unresolved = parse_unresolved(&input);
+    let mut scope = Scope::with_limit(&unresolved, DEFAULT_RECURSION_LIMIT);
+    match scope.apply() {
+        Err(Error::RecursionLimit { limit, .. }) => assert_eq!(limit, 100),
+        other => panic!("ordered chain must match head-first limit outcome: {other:?}"),
+    }
+    Scope::with_limit(&unresolved, 200)
+        .apply()
+        .expect("ordered chain resolves when the limit covers the chain");
 }
 
 #[test]

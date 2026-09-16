@@ -275,6 +275,7 @@ impl<'source> Parser<'source> {
             return error::RecursionLimitSnafu {
                 location: self.tokens.location(),
                 limit: MAX_RECURSION_DEPTH,
+                kind: "parser nesting",
             }
             .fail();
         }
@@ -1655,7 +1656,7 @@ mod test {
         let result = parser.enter_recursion();
         assert!(result.is_err());
         let error_msg = format!("{}", result.unwrap_err());
-        assert!(error_msg.contains("recursion limit exceeded"));
+        assert!(error_msg.contains("parser nesting limit exceeded"));
     }
 
     #[test]

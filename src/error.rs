@@ -137,8 +137,15 @@ pub enum Error {
     NotFound { path: PathBuf },
     #[snafu(display("{location} - not a scope with fields"))]
     NotScope { location: Location },
-    #[snafu(display("{location} - recursion limit exceeded: maximum depth of {limit} reached"))]
-    RecursionLimit { location: Location, limit: usize },
+    #[snafu(display("{location} - {kind} limit exceeded: maximum depth of {limit} reached"))]
+    RecursionLimit {
+        location: Location,
+        limit: usize,
+        /// Which kind of limit was hit: `"parser nesting"` (lexical/AST
+        /// nesting cap, fixed at 64) or `"reference depth"` (the configured
+        /// reference-resolution chain limit)
+        kind: &'static str,
+    },
     #[snafu(display("{location} - invalid semantic version requirement: {reason}"))]
     Require { location: Location, reason: String },
     #[snafu(display(

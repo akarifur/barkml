@@ -10,7 +10,10 @@ use uuid::Uuid;
 
 /// Default maximum expansion depth for reference resolution when no
 /// explicit limit is configured; guards long acyclic dependency chains.
-const DEFAULT_RECURSION_LIMIT: usize = 100;
+///
+/// Single source of truth for the default limit: the `Loader` trait
+/// default and `LoaderConfig::default` derive from this constant.
+pub const DEFAULT_RECURSION_LIMIT: usize = 100;
 
 /// A single component of a structured symbol-table path or reference.
 ///
@@ -152,8 +155,13 @@ struct Traversal {
     stack: Vec<Frame>,
     /// Path -> position on the active stack
     index: HashMap<Vec<Segment>, usize>,
-    /// Successfully resolved nodes keyed by canonical path
-    resolved: IndexMap<Vec<Segment>, Value>,
+    /// Successfully resolved nodes keyed by canonical path, with the
+    /// dependency height reached during their expansion (the number of
+    /// reference edges in their longest dependency chain). Heights are
+    /// charged on reuse so a cached target cannot let an over-limit chain
+    /// bypass the configured bound, keeping outcomes independent of
+    /// declaration order and prior resolution.
+    resolved: IndexMap<Vec<Segment>, (Value, usize)>,
 }
 
 /// One active dependency node and the reference edge that led to it.
@@ -199,12 +207,13 @@ impl Traversal {
     }
 
     /// Pops the frame pushed at `mark` after a successful expansion and
-    /// caches the resolved value for valid reuse by later references.
-    fn settle(&mut self, mark: usize, value: Value) {
+    /// caches the resolved value and its dependency height for valid reuse
+    /// by later references.
+    fn settle(&mut self, mark: usize, value: Value, height: usize) {
         let frame = self.stack.pop().expect("settle mark must be on the stack");
         debug_assert_eq!(self.stack.len(), mark);
         self.index.remove(&frame.path);
-        self.resolved.insert(frame.path, value);
+        self.resolved.insert(frame.path, (value, height));
     }
 }
 
@@ -326,12 +335,16 @@ impl Scope {
     /// Resolves a structured reference to its actual value, preserving the
     /// target's type and data. All lookups are root-relative; `self`/`super`
     /// carry no special meaning.
+    /// Resolves a structured reference to its actual value, preserving the
+    /// target's type and data, and reports the target entry's dependency
+    /// height (reference edges in its longest dependency chain). All
+    /// lookups are root-relative; `self`/`super` carry no special meaning.
     fn resolve_reference(
         &mut self,
         at: &Value,
         segments: &[Segment],
         traversal: &mut Traversal,
-    ) -> Result<Value> {
+    ) -> Result<(Value, usize)> {
         let matches = self.reference_matches(segments);
         if matches.len() > 1 {
             return error::WrongSelectorSnafu {
@@ -347,8 +360,8 @@ impl Scope {
             .next()
             .map(|(path, value)| (path.clone(), value.clone()));
         match found {
-            Some((path, target)) => self.resolve_entry(at, &path, &target, traversal),
-            None => self.reference_failure(at, segments),
+            Some((path, target)) => self.resolve_entry(at, &path, &target, traversal, true),
+            None => self.reference_failure(at, segments).map(|value| (value, 0)),
         }
     }
 
@@ -357,44 +370,73 @@ impl Scope {
     ///
     /// Cycle, reuse, and depth are decided here, in that order: a back-edge
     /// to an active node is a cycle even at the depth limit; an edge to a
-    /// resolved node reuses the cached result rebuilt with the caller's
-    /// identity; only otherwise is another expansion charged against the
-    /// limit.
+    /// resolved node reuses the cached result (charging its retained
+    /// dependency height) rebuilt with the caller's identity; only
+    /// otherwise is another expansion charged against the limit.
+    ///
+    /// Depth counts reference dependency edges: the root entry of a
+    /// top-level statement (`via_reference == false`) is free, and each
+    /// entry reached through a reference edge consumes one unit. A limit
+    /// of `N` therefore permits an acyclic chain of exactly `N` edges and
+    /// rejects one requiring `N + 1`, at the edge that would exceed it —
+    /// regardless of declaration order or cache reuse.
     fn resolve_entry(
         &mut self,
         at: &Value,
         path: &[Segment],
         target: &Value,
         traversal: &mut Traversal,
-    ) -> Result<Value> {
+        via_reference: bool,
+    ) -> Result<(Value, usize)> {
         if let Some(start) = traversal.active_position(path) {
-            return self.cycle_error(at, traversal, start, path);
+            return self.cycle_error(at, traversal, start, path).map(|v| (v, 0));
         }
-        if let Some(cached) = traversal.resolved.get(path) {
-            return Ok(Value {
-                uid: at.uid,
-                data: cached.data.clone(),
-                meta: at.meta.clone(),
-            });
+        if let Some((cached, height)) = traversal.resolved.get(path) {
+            // Deterministic reuse: a cached entry sits at depth
+            // `stack.len()` (the root is at depth 0), so its subtree
+            // reaches `depth + height`; permit while that stays in budget.
+            ensure!(
+                !via_reference || traversal.stack.len() + height <= self.recursion_limit,
+                error::RecursionLimitSnafu {
+                    location: at.meta.location.clone(),
+                    limit: self.recursion_limit,
+                    kind: "reference depth",
+                }
+            );
+            return Ok((
+                Value {
+                    uid: at.uid,
+                    data: cached.data.clone(),
+                    meta: at.meta.clone(),
+                },
+                *height,
+            ));
         }
+        // Every pushed node after the root was entered through a reference
+        // edge, so the edge count equals the stack length; taking another
+        // edge is permitted while that count does not exceed the limit.
         ensure!(
-            traversal.stack.len() < self.recursion_limit,
+            !via_reference || traversal.stack.len() <= self.recursion_limit,
             error::RecursionLimitSnafu {
                 location: at.meta.location.clone(),
                 limit: self.recursion_limit,
+                kind: "reference depth",
             }
         );
 
         let mark = traversal.push(path, at.meta.location.clone());
         let result = self.resolve_value(target, traversal);
         match result {
-            Ok(resolved) => {
-                traversal.settle(mark, resolved.clone());
-                Ok(Value {
-                    uid: at.uid,
-                    data: resolved.data,
-                    meta: at.meta.clone(),
-                })
+            Ok((resolved, height)) => {
+                traversal.settle(mark, resolved.clone(), height);
+                Ok((
+                    Value {
+                        uid: at.uid,
+                        data: resolved.data,
+                        meta: at.meta.clone(),
+                    },
+                    height,
+                ))
             }
             Err(err) => {
                 traversal.unwind(mark);
@@ -563,7 +605,8 @@ impl Scope {
                 let (labels, children) = at.get_labeled().unwrap();
 
                 for label in labels {
-                    new_labels.push(self.resolve_value(label, traversal)?);
+                    let (resolved, _) = self.resolve_value(label, traversal)?;
+                    new_labels.push(resolved);
                 }
 
                 for (key, value) in children.iter() {
@@ -586,7 +629,8 @@ impl Scope {
                 // declared types stay enforced against the resolved value
                 let adopts_target = contains_reference_impl(expected);
                 let value = at.get_value().unwrap();
-                let new_value = self.resolve_entry(value, &node_path, value, traversal)?;
+                let (new_value, _) =
+                    self.resolve_entry(value, &node_path, value, traversal, false)?;
                 let expected = if adopts_target {
                     new_value.type_of()
                 } else {
@@ -610,62 +654,93 @@ impl Scope {
     /// the same traversal state (cycle, reuse, depth, and missing-target
     /// semantics) as ordinary references and rendered under the scalar-only
     /// interpolation policy.
+    /// Resolves an interpolated string: each placeholder is resolved with
+    /// the same traversal state (cycle, reuse, depth, and missing-target
+    /// semantics) as ordinary references and rendered under the scalar-only
+    /// interpolation policy. Holes are siblings: the resulting height is
+    /// the deepest hole chain, not their sum.
     fn resolve_template(
         &mut self,
         at: &Value,
         parts: &[TemplatePart],
         traversal: &mut Traversal,
-    ) -> Result<Value> {
+    ) -> Result<(Value, usize)> {
         let mut out = String::new();
+        let mut height = 0;
         for part in parts {
             match part {
                 TemplatePart::Literal(text) => out.push_str(text),
                 TemplatePart::Placeholder(segments, location) => {
-                    let resolved = self.resolve_reference(at, segments, traversal)?;
+                    let (resolved, hole_height) =
+                        self.resolve_reference(at, segments, traversal)?;
                     out.push_str(&resolved.render_scalar(location)?);
+                    height = height.max(hole_height + 1);
                 }
             }
         }
 
-        Ok(Value {
-            uid: at.uid,
-            data: Data::String(out),
-            meta: at.meta.clone(),
-        })
+        Ok((
+            Value {
+                uid: at.uid,
+                data: Data::String(out),
+                meta: at.meta.clone(),
+            },
+            height,
+        ))
     }
 
     /// Resolves all references in a value. Dependency nodes are entered via
     /// `resolve_entry`; container children are part of their parent entry's
     /// expansion, so cycles and reuse are tracked at node granularity.
-    fn resolve_value(&mut self, at: &Value, traversal: &mut Traversal) -> Result<Value> {
+    /// Resolves all references in a value, returning the resolved value and
+    /// its dependency height (the number of reference edges in its longest
+    /// chain; literals have height 0). Dependency nodes are entered via
+    /// `resolve_entry`; container children are part of their parent entry's
+    /// expansion, so cycles and reuse are tracked at node granularity.
+    fn resolve_value(&mut self, at: &Value, traversal: &mut Traversal) -> Result<(Value, usize)> {
         match &at.data {
-            Data::Reference(segments) => self.resolve_reference(at, segments, traversal),
+            Data::Reference(segments) => {
+                let (value, height) = self.resolve_reference(at, segments, traversal)?;
+                Ok((value, height + 1))
+            }
             Data::Template(parts) => self.resolve_template(at, parts, traversal),
             Data::Table(children) => {
                 let uid = at.uid;
                 let mut new_children = IndexMap::new();
+                let mut height = 0;
                 for (key, value) in children.iter() {
-                    new_children.insert(key.clone(), self.resolve_value(value, traversal)?);
+                    let (resolved, child_height) = self.resolve_value(value, traversal)?;
+                    height = height.max(child_height);
+                    new_children.insert(key.clone(), resolved);
                 }
-                Ok(Value {
-                    uid,
-                    data: Data::Table(new_children),
-                    meta: at.meta.clone(),
-                })
+                Ok((
+                    Value {
+                        uid,
+                        data: Data::Table(new_children),
+                        meta: at.meta.clone(),
+                    },
+                    height,
+                ))
             }
             Data::Array(children) => {
                 let uid = at.uid;
                 let mut new_children = Vec::new();
+                let mut height = 0;
                 for value in children.iter() {
-                    new_children.push(self.resolve_value(value, traversal)?);
+                    let (resolved, child_height) = self.resolve_value(value, traversal)?;
+                    height = height.max(child_height);
+                    new_children.push(resolved);
                 }
-                Ok(Value {
-                    uid,
-                    data: Data::Array(new_children),
-                    meta: at.meta.clone(),
-                })
+                Ok((
+                    Value {
+                        uid,
+                        data: Data::Array(new_children),
+                        meta: at.meta.clone(),
+                    },
+                    height,
+                ))
             }
-            _ => Ok(at.clone()),
+            _ => Ok((at.clone(), 0)),
         }
     }
 

@@ -10,7 +10,7 @@
 //! - **StandardLoader**: The primary implementation for loading BarkML files
 //! - **Walk**: Ergonomic API for traversing and extracting data from loaded documents
 //!
-use crate::ast::{Scope, Statement};
+use crate::ast::{DEFAULT_RECURSION_LIMIT, Scope, Statement};
 use crate::{Result, error};
 use std::path::Path;
 
@@ -43,11 +43,10 @@ pub trait Loader {
     /// This guard bounds long acyclic dependency chains; reference cycles
     /// are detected structurally and are not affected by the limit.
     ///
-    /// # Returns
-    ///
-    /// The configured limit, defaulting to 100
+    /// The configured limit, defaulting to
+    /// [`DEFAULT_RECURSION_LIMIT`](crate::DEFAULT_RECURSION_LIMIT)
     fn max_recursion_depth(&self) -> usize {
-        100
+        DEFAULT_RECURSION_LIMIT
     }
 
     /// Disables macro resolution for this loader
@@ -142,7 +141,7 @@ impl Default for LoaderConfig {
         Self {
             resolve_macros: true,
             allow_collisions: false,
-            max_recursion_depth: 100,
+            max_recursion_depth: DEFAULT_RECURSION_LIMIT,
             validate_on_load: false,
             search_paths: vec![std::env::current_dir().unwrap_or_else(|_| ".".into())],
         }
